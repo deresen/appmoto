@@ -1,7 +1,7 @@
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig, type HtmlTagDescriptor, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { readFileSync } from "node:fs";
-import { advertisingOwnership } from "./shared/advertising.ts";
+import { ADSENSE_SCRIPT_ID, adSenseScriptUrl, advertisingOwnership, parseAdvertisingConfig } from "./shared/advertising.ts";
 
 function readAdvertisingConfiguration(): unknown {
   try {
@@ -13,8 +13,26 @@ export function advertisingOwnershipPlugin(readConfiguration = readAdvertisingCo
   return {
     name: "passo-advertising-ownership",
     transformIndexHtml() {
-      const ownership = advertisingOwnership(readConfiguration());
-      return ownership ? [{ tag: "meta", attrs: { name: "google-adsense-account", content: ownership.clientId }, injectTo: "head" as const }] : [];
+      const input = readConfiguration();
+      const ownership = advertisingOwnership(input);
+      if (!ownership) return [];
+      const tags: HtmlTagDescriptor[] = [{ tag: "meta", attrs: { name: "google-adsense-account", content: ownership.clientId }, injectTo: "head" }];
+      if (parseAdvertisingConfig(input).loadScriptInHead) {
+        tags.push({
+          tag: "script",
+          attrs: {
+            id: ADSENSE_SCRIPT_ID,
+            async: true,
+            src: adSenseScriptUrl(ownership.clientId),
+            crossorigin: "anonymous",
+            "data-passo-load-state": "pending",
+            onload: "this.dataset.passoLoadState='loaded'",
+            onerror: "this.dataset.passoLoadState='error'",
+          },
+          injectTo: "head",
+        });
+      }
+      return tags;
     },
     generateBundle() {
       const ownership = advertisingOwnership(readConfiguration());

@@ -1881,11 +1881,16 @@ export default function App() {
             </p>
             <h3>Pubblicità</h3>
             <p>
-              Gli spazi pubblicitari sono separati dalle segnalazioni. Gli
-              annunci Google vengono caricati dopo il consenso alla pubblicità.
-              Quando il servizio è attivo, puoi rivedere la scelta da
+              Il sito carica lo script Google AdSense all’apertura per il
+              collegamento al servizio pubblicitario. I due banner dell’app
+              sono separati dalle segnalazioni e richiedono la configurazione
+              del servizio e il consenso alla pubblicità. Quando il servizio è
+              attivo, puoi rivedere la scelta da
               “Preferenze pubblicità” in fondo alla pagina.
             </p>
+            <a href="https://policies.google.com/privacy?hl=it" target="_blank" rel="noreferrer">
+              Informativa sulla privacy di Google <ArrowUpRight size={14} />
+            </a>
             <a
               href="https://osmfoundation.org/wiki/Privacy_Policy"
               target="_blank"

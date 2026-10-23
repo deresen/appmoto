@@ -1,4 +1,6 @@
 import {
+  ADSENSE_SCRIPT_ID,
+  adSenseScriptUrl,
   hasAdvertisingConsent,
   isAdvertisingConfigured,
   parseAdvertisingConfig,
@@ -53,9 +55,31 @@ function loadScript(id: string, source: string, crossOrigin = false): Promise<vo
   const existing = scripts.get(id);
   if (existing) return existing;
   const promise = new Promise<void>((resolve, reject) => {
-    // Only this module creates these IDs. An unrelated script is never trusted.
-    if (document.getElementById(id)) {
-      reject(new Error("Advertising script already present outside the loader."));
+    const existingScript = document.getElementById(id);
+    if (existingScript) {
+      // The build can place the AdSense tag in the initial HTML for Google's
+      // verification. Adopt only that exact tag; CMP scripts stay loader-owned.
+      if (id !== ADSENSE_SCRIPT_ID || !(existingScript instanceof HTMLScriptElement)
+        || existingScript.src !== source || !existingScript.async
+        || existingScript.crossOrigin !== "anonymous"
+        || !["pending", "loaded", "error"].includes(existingScript.dataset.passoLoadState ?? "")) {
+        reject(new Error("Advertising script does not match the configured tag."));
+        return;
+      }
+      if (existingScript.dataset.passoLoadState === "loaded") { resolve(); return; }
+      if (existingScript.dataset.passoLoadState === "error") { reject(new Error("Advertising script unavailable.")); return; }
+      const finish = (error?: Error) => {
+        window.clearTimeout(timer);
+        existingScript.removeEventListener("load", loaded);
+        existingScript.removeEventListener("error", failed);
+        if (error) reject(error);
+        else resolve();
+      };
+      const loaded = () => finish();
+      const failed = () => finish(new Error("Advertising script unavailable."));
+      const timer = window.setTimeout(() => finish(new Error("Advertising script timed out.")), 15000);
+      existingScript.addEventListener("load", loaded);
+      existingScript.addEventListener("error", failed);
       return;
     }
     const script = document.createElement("script");
@@ -97,7 +121,7 @@ async function listenForConsent() {
   });
 }
 
-/** Fetching local configuration never starts an advertising or CMP request by itself. */
+/** Initialize display units; any build-time AdSense tag loads independently. */
 export function initializeAdvertising(): Promise<void> {
   if (initialization) return initialization;
   initialization = (async () => {
@@ -122,7 +146,7 @@ export async function requestAdvertisingUnit(element: HTMLElement, placement: Ad
   if (state.status !== "consented" || !isAdvertisingConfigured(config) || !config.slots[placement]
     || !element.isConnected || requestedUnits.has(element)) return;
   try {
-    await loadScript("passo-google-adsense", `https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${config.clientId}`, true);
+    await loadScript(ADSENSE_SCRIPT_ID, adSenseScriptUrl(config.clientId), true);
     if (state.status !== "consented" || state.consentEpoch !== consentEpoch
       || !element.isConnected || requestedUnits.has(element)) return;
     requestedUnits.add(element);

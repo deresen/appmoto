@@ -1,8 +1,14 @@
 export const AD_PLACEMENTS = ["afterMap", "footer"] as const;
 export type AdPlacement = (typeof AD_PLACEMENTS)[number];
+export const ADSENSE_SCRIPT_ID = "passo-google-adsense";
+
+export function adSenseScriptUrl(clientId: string): string {
+  return `https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${clientId}`;
+}
 
 export interface AdvertisingConfig {
   enabled: boolean;
+  loadScriptInHead: boolean;
   publisherId: string;
   clientId: string;
   slots: Record<AdPlacement, string>;
@@ -51,6 +57,7 @@ export function parseAdvertisingConfig(value: unknown): AdvertisingConfig {
   }
   return {
     enabled: input.enabled === true,
+    loadScriptInHead: input.loadScriptInHead === true,
     publisherId,
     clientId: publisherId ? `ca-${publisherId}` : "",
     slots,
