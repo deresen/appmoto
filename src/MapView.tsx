@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { divIcon, DomEvent, type TileLayer as LeafletTileLayer } from "leaflet";
-import { MapContainer, Marker, TileLayer, useMap } from "react-leaflet";
+import { divIcon, DomEvent, latLng, type TileLayer as LeafletTileLayer } from "leaflet";
+import { Circle, CircleMarker, MapContainer, Marker, TileLayer, Tooltip, useMap } from "react-leaflet";
 import type { Category, Report } from "./types";
 
 type Position = { latitude: number; longitude: number };
 type Bounds = { north: number; south: number; east: number; west: number };
-type MapTarget = Position & { zoom?: number; key: number };
+type MapTarget = Position & { zoom?: number; radiusMeters?: number; key: number };
 
 type MapViewProps = {
   reports: Report[];
@@ -17,23 +17,34 @@ type MapViewProps = {
   onPick: (position: Position) => void;
   onBoundsChange: (bounds: Bounds) => void;
   onMapReady?: () => void;
+  nearby?: (Position & { radiusMeters: number }) | null;
 };
 
 const categoryNames: Record<Category, string> = {
   pothole: "Buca",
+  rough_road: "Strada dissestata",
   gravel: "Ghiaia",
+  dirt: "Terra sulla strada",
+  mud: "Fango sulla strada",
   oil: "Olio",
   obstacle: "Ostacolo",
   closure: "Chiusura",
+  mobile_speed_camera: "Autovelox mobile",
+  other: "Altro pericolo",
 };
 
 const categoryPaths: Record<Category, string> = {
   pothole: '<path d="M4 5v14m16-14v14M9 3v4m6 10v4M8 13l3-3 3 4 3-3"/>',
+  rough_road: '<path d="M3 5h18M3 19h18M3 13l4-3 4 5 4-5 3 3 3-1"/>',
   gravel:
     '<circle cx="8" cy="8" r="2.5"/><circle cx="16" cy="15" r="3"/><circle cx="6" cy="18" r="1.5"/><path d="m17 5 2 2m-8 12 1 1"/>',
+  dirt: '<path d="M3 18h18M4 18l4-7 3 3 3-5 6 9M7 6h.01M17 5h.01"/>',
+  mud: '<path d="M4 9a4 4 0 0 1 4-4h1a4 4 0 0 1 7 1h1a3 3 0 0 1 0 6H6M7 14l-1 3m6-2-1 3m6-3-1 3M3 21h18"/>',
   oil: '<path d="M12 3s-6 7-6 11a6 6 0 0 0 12 0c0-4-6-11-6-11Z"/><path d="M9 14a3 3 0 0 0 3 3"/>',
   obstacle: '<path d="m12 3 10 18H2L12 3Z"/><path d="M12 9v5m0 3v.1"/>',
   closure: '<circle cx="12" cy="12" r="9"/><path d="M7 12h10"/>',
+  mobile_speed_camera: '<rect x="4" y="5" width="16" height="12" rx="2"/><circle cx="12" cy="11" r="3"/><path d="M9 21h6m-3-4v4M18 2l2 1M5 2 3 3"/>',
+  other: '<path d="m12 3 10 18H2L12 3Z"/><path d="M12 8v6m0 3v.01"/>',
 };
 
 function reportIcon(report: Report, selected: boolean) {
@@ -135,10 +146,16 @@ function MapBehavior({
       const reducedMotion = window.matchMedia(
         "(prefers-reduced-motion: reduce)",
       ).matches;
-      map.flyTo([target.latitude, target.longitude], target.zoom ?? 14, {
-        animate: !reducedMotion,
-        duration: 0.7,
-      });
+      if (target.radiusMeters) {
+        map.flyToBounds(latLng(target.latitude, target.longitude).toBounds(target.radiusMeters * 2), {
+          padding: [30, 30], maxZoom: 14, animate: !reducedMotion, duration: 0.7,
+        });
+      } else {
+        map.flyTo([target.latitude, target.longitude], target.zoom ?? 14, {
+          animate: !reducedMotion,
+          duration: 0.7,
+        });
+      }
     }
   }, [map, target?.key]);
 
@@ -235,6 +252,12 @@ export default function MapView(props: MapViewProps) {
           onMapReady={props.onMapReady}
         />
         <MapZoom />
+        {props.nearby && <>
+          <Circle center={[props.nearby.latitude, props.nearby.longitude]} radius={props.nearby.radiusMeters} pathOptions={{ color: "#427c9a", weight: 1.5, fillColor: "#74aec4", fillOpacity: 0.07, dashArray: "5 5" }} interactive={false} />
+          <CircleMarker center={[props.nearby.latitude, props.nearby.longitude]} radius={7} pathOptions={{ color: "#fff", weight: 3, fillColor: "#327da3", fillOpacity: 1 }}>
+            <Tooltip>Posizione usata per Vicino a me</Tooltip>
+          </CircleMarker>
+        </>}
         {props.reports.map((report) => (
           <Marker
             key={report.id}

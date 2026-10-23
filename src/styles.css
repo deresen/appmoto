@@ -2840,3 +2840,63 @@ main {
   .detail-vote-footer > span { font-size: 10px; }
   .clear-progress p { font-size: 11px; }
 }
+
+/* Expanded report categories and the optional one-shot location filter. */
+.category-filters { min-width: 0; flex: 1; }
+.filter-chip { flex-shrink: 0; min-height: 40px; }
+.connection-status { flex-shrink: 0; }
+.category-icon--rough_road { background: #f3efdf; color: #8b7548; }
+.category-icon--dirt { background: #f6eddc; color: #99733f; }
+.category-icon--mud { background: #f2e9e2; color: #8a6551; }
+.category-icon--mobile_speed_camera { background: #e7f2f7; color: #397da0; }
+.category-icon--other { background: #eaf0ed; color: #74857c; }
+.form-categories { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.form-categories button { min-width: 0; min-height: 87px; font-size: 11px; line-height: 1.4; padding: 13px 8px 11px; }
+.form-categories button > span { display: block; white-space: normal; overflow-wrap: normal; text-align: center; }
+.form-categories button > svg { flex-shrink: 0; }
+.location-button.is-active { background: #edf5eb; color: #4c7040; border-color: #aac49b; }
+.nearby-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px 18px; border: 1px solid #cfded1; border-radius: 10px; background: #f4f8f1; padding: 16px 18px; margin-top: 15px; }
+.nearby-status { display: flex; align-items: flex-start; gap: 10px; min-width: 0; color: #66805a; }
+.nearby-status > svg { flex-shrink: 0; margin-top: 3px; }
+.nearby-status strong { display: block; font-size: 12px; line-height: 1.6; color: #4d6842; }
+.nearby-status span { display: block; font-size: 10px; line-height: 1.8; color: #7e8f73; margin-top: 3px; }
+.nearby-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.nearby-actions label { display: flex; align-items: center; gap: 9px; font-size: 11px; font-weight: 700; color: #657b55; }
+.nearby-actions select { min-height: 44px; border: 1px solid #cad9bd; border-radius: 7px; background: #fff; color: #4c663f; padding: 8px 9px; font-size: 12px; }
+.nearby-actions button { display: flex; align-items: center; justify-content: center; gap: 6px; min-height: 44px; border-radius: 7px; padding: 10px 11px; font-size: 11px; font-weight: 650; line-height: 1.5; }
+.nearby-refresh { border: 1px solid #d4dfca; background: #fff; color: #647e52; }
+.nearby-disable { color: #7a8870; }
+.nearby-actions button:hover:not(:disabled) { background: #eaf1e3; }
+.nearby-scope { grid-column: 1 / -1; font-size: 10px; color: #839277; line-height: 1.9; margin: 0; padding-top: 10px; border-top: 1px solid #e0e8d8; }
+.nearby-error { display: flex; align-items: flex-start; gap: 9px; margin-top: 14px; padding: 13px 15px; background: #fff6ee; border: 1px solid #ecd3bd; border-radius: 8px; color: #9c704e; font-size: 12px; line-height: 1.8; }
+.nearby-error > svg { flex-shrink: 0; margin-top: 3px; }
+.nearby-error button { margin-left: auto; color: #8f6241; text-decoration: underline; font-size: 11px; font-weight: 700; flex-shrink: 0; min-height: 32px; }
+.nearby-empty-actions { display: flex; align-items: center; flex-direction: column; gap: 7px; margin-bottom: 13px; }
+.nearby-empty-actions .text-button { margin-top: 0; min-height: 38px; }
+.card-distance { display: flex; align-items: center; gap: 5px; margin-top: 10px; font-size: 10px; font-weight: 650; color: #638198; }
+@media (max-width: 1120px) {
+  .nearby-controls { grid-template-columns: 1fr; }
+  .nearby-actions { justify-content: flex-start; }
+}
+@media (max-width: 600px) {
+  .form-categories { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+  .form-categories button { min-height: 82px; padding: 12px 7px; font-size: 11px; gap: 8px; }
+  .form-categories button > svg { width: 23px; height: 23px; }
+  .form-categories .category-check { width: 13px; height: 13px; }
+  .filter-chip { min-height: 44px; }
+  .nearby-controls { padding: 14px; gap: 12px; margin-top: 13px; }
+  .nearby-status strong { font-size: 13px; }
+  .nearby-status span, .nearby-scope { font-size: 11px; }
+  .nearby-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .nearby-actions label { justify-content: flex-start; font-size: 11px; }
+  .nearby-actions select { flex: 1; min-width: 0; font-size: 16px; }
+  .nearby-actions button { font-size: 11px; padding: 9px 6px; }
+  .nearby-disable { grid-column: 1 / -1; border: 1px solid #d8e2cf; }
+  .nearby-error { flex-wrap: wrap; padding: 11px; font-size: 11px; }
+  .nearby-error > span { flex: 1; min-width: 0; }
+  .nearby-error button { width: 100%; margin-left: 0; min-height: 38px; }
+  .card-distance { font-size: 11px; }
+}
+@media (max-width: 360px) {
+  .form-categories { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

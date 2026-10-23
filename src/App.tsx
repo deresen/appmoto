@@ -14,6 +14,7 @@ import {
   ChevronDown,
   CircleHelp,
   CircleOff,
+  CloudRain,
   Construction,
   Crosshair,
   Droplets,
@@ -27,9 +28,11 @@ import {
   Navigation,
   Plus,
   Radio,
+  Radar,
   Route,
   Search,
   ShieldCheck,
+  Shovel,
   Sparkles,
   ThumbsUp,
   TriangleAlert,
@@ -40,8 +43,10 @@ import MapView from "./MapView";
 import type { Category, NewReport, Report, Severity } from "./types";
 import {
   CLEAR_VOTE_THRESHOLD,
+  CATEGORY_VALUES,
   DUPLICATE_RADIUS_METERS,
   distanceMeters,
+  reportLifetimeMs,
 } from "../shared/reportRules";
 
 const CATEGORIES = {
@@ -51,11 +56,29 @@ const CATEGORIES = {
     icon: CircleOff,
     color: "#c27919",
   },
+  rough_road: {
+    label: "Strada dissestata",
+    singular: "Strada dissestata",
+    icon: Waves,
+    color: "#8b7548",
+  },
   gravel: {
     label: "Ghiaia",
     singular: "Ghiaia",
     icon: Layers,
     color: "#96723e",
+  },
+  dirt: {
+    label: "Terra",
+    singular: "Terra sulla strada",
+    icon: Shovel,
+    color: "#99733f",
+  },
+  mud: {
+    label: "Fango",
+    singular: "Fango sulla strada",
+    icon: CloudRain,
+    color: "#8a6551",
   },
   oil: {
     label: "Olio",
@@ -75,9 +98,23 @@ const CATEGORIES = {
     icon: Construction,
     color: "#c34e52",
   },
+  mobile_speed_camera: {
+    label: "Autovelox mobile",
+    singular: "Autovelox mobile",
+    icon: Radar,
+    color: "#397da0",
+  },
+  other: {
+    label: "Altro pericolo",
+    singular: "Altro pericolo",
+    icon: CircleHelp,
+    color: "#74857c",
+  },
 } as const;
-const CATEGORY_KEYS = Object.keys(CATEGORIES) as Category[];
+const CATEGORY_KEYS = CATEGORY_VALUES;
 type Position = { latitude: number; longitude: number };
+type NearbyRadius = 5 | 10 | 25;
+type NearbyArea = { position: Position; updatedAt: number };
 type Bounds = { north: number; south: number; east: number; west: number };
 type Draft = {
   category: Category;
@@ -110,6 +147,17 @@ function searchable(value: string) {
     .normalize("NFD")
     .replace(/\p{Diacritic}/gu, "")
     .toLocaleLowerCase("it");
+}
+
+function formatDistance(meters: number) {
+  return meters < 1000
+    ? `${Math.round(meters / 10) * 10} m`
+    : `${(meters / 1000).toLocaleString("it-IT", { maximumFractionDigits: 1 })} km`;
+}
+
+function reportDuration(category: Category) {
+  const hours = reportLifetimeMs(category) / 3_600_000;
+  return hours === 1 ? "1 ora" : `${hours} ore`;
 }
 
 class ApiError extends Error {
@@ -268,11 +316,18 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [showDemo, setShowDemo] = useState(true);
   const [sort, setSort] = useState("recent");
+  const [nearby, setNearby] = useState<NearbyArea | null>(null);
+  const [nearbyRadius, setNearbyRadius] = useState<NearbyRadius>(10);
+  const [nearbyPending, setNearbyPending] = useState(false);
+  const [nearbyError, setNearbyError] = useState("");
+  const nearbyRequest = useRef(0);
+  const nearbyCurrent = useRef({ area: nearby, radius: nearbyRadius });
+  nearbyCurrent.current = { area: nearby, radius: nearbyRadius };
   const [bounds, setBounds] = useState<Bounds | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [lastSelected, setLastSelected] = useState<Report | null>(null);
   const [target, setTarget] = useState<
-    (Position & { zoom?: number; key: number }) | null
+    (Position & { zoom?: number; radiusMeters?: number; key: number }) | null
   >(null);
   const [mobileView, setMobileView] = useState<"map" | "list">("map");
   const [dialog, setDialog] = useState<
@@ -297,6 +352,8 @@ export default function App() {
   const [locating, setLocating] = useState(false);
   const [toast, setToast] = useState("");
   const [, setTick] = useState(0);
+
+  useEffect(() => () => { nearbyRequest.current += 1; }, []);
 
   const draftKey = JSON.stringify(draft);
   const latestDraftKey = useRef(draftKey);
@@ -436,7 +493,13 @@ export default function App() {
   const baseReports = activeReports.filter(
     (report) => showDemo || report.source !== "demo",
   );
-  const filtered = baseReports.filter((report) => {
+  const distanceFromNearby = (report: Report) => nearby
+    ? distanceMeters(nearby.position.latitude, nearby.position.longitude, report.latitude, report.longitude)
+    : 0;
+  const nearbyReports = nearby
+    ? baseReports.filter((report) => distanceFromNearby(report) <= nearbyRadius * 1000)
+    : baseReports;
+  const filtered = nearbyReports.filter((report) => {
     const matchesCategory = category === "all" || report.category === category;
     const text = searchable(
       `${report.location} ${report.description} ${CATEGORIES[report.category].label}`,
@@ -446,6 +509,7 @@ export default function App() {
   const visible = filtered
     .filter(
       (report) =>
+        nearby ||
         query.trim() ||
         !bounds ||
         (report.latitude <= bounds.north &&
@@ -454,7 +518,9 @@ export default function App() {
           report.longitude >= bounds.west),
     )
     .sort((a, b) =>
-      sort === "confirmed"
+      sort === "distance" && nearby
+        ? distanceFromNearby(a) - distanceFromNearby(b) || Date.parse(b.createdAt) - Date.parse(a.createdAt)
+        : sort === "confirmed"
         ? b.confirmations - a.confirmations ||
           Date.parse(b.createdAt) - Date.parse(a.createdAt)
         : Date.parse(b.createdAt) - Date.parse(a.createdAt),
@@ -486,11 +552,63 @@ export default function App() {
     setPicking(false);
     setDialog("new");
   }
+  function disableNearby() {
+    nearbyRequest.current += 1;
+    setNearby(null);
+    setNearbyPending(false);
+    setNearbyError("");
+    setSort((previous) => previous === "distance" ? "recent" : previous);
+  }
+  function prepareReportFocus(report: Report) {
+    // A pending location request must not hide this point after publication.
+    nearbyRequest.current += 1;
+    setNearbyPending(false);
+    const { area, radius } = nearbyCurrent.current;
+    const outside = Boolean(area && distanceMeters(
+      area.position.latitude, area.position.longitude, report.latitude, report.longitude,
+    ) > radius * 1000);
+    if (outside) disableNearby();
+    return outside;
+  }
+  function findNearby() {
+    const request = ++nearbyRequest.current;
+    setNearbyError("");
+    if (!navigator.geolocation) {
+      setNearby(null);
+      setNearbyPending(false);
+      setSort((previous) => previous === "distance" ? "recent" : previous);
+      setNearbyError("Questo browser non supporta la posizione. Vicino a me non è attivo: puoi esplorare la mappa.");
+      return;
+    }
+    setNearbyPending(true);
+    navigator.geolocation.getCurrentPosition((position) => {
+      if (nearbyRequest.current !== request) return;
+      const point = { latitude: position.coords.latitude, longitude: position.coords.longitude };
+      setNearby({ position: point, updatedAt: Date.now() });
+      setNearbyPending(false);
+      setSort("distance");
+      setTarget({ ...point, radiusMeters: nearbyRadius * 1000, key: Date.now() });
+    }, (error) => {
+      if (nearbyRequest.current !== request) return;
+      setNearby(null);
+      setNearbyPending(false);
+      setSort((previous) => previous === "distance" ? "recent" : previous);
+      setNearbyError(error.code === 1
+        ? "Posizione non autorizzata. Vicino a me non è attivo: puoi consentire la posizione nel browser oppure esplorare la mappa."
+        : error.code === 3
+          ? "La ricerca della posizione ha impiegato troppo tempo. Vicino a me non è attivo: riprova o esplora la mappa."
+          : "Posizione non disponibile. Vicino a me non è attivo: riprova o esplora la mappa.");
+    }, { enableHighAccuracy: false, timeout: 12000, maximumAge: 0 });
+  }
+  function changeNearbyRadius(radius: NearbyRadius) {
+    setNearbyRadius(radius);
+    if (nearby) setTarget({ ...nearby.position, radiusMeters: radius * 1000, key: Date.now() });
+  }
   function getPosition(forReport = false) {
     if (!navigator.geolocation) {
-      setToast(
-        "Questo browser non supporta la posizione. Scegli un punto sulla mappa.",
-      );
+      const message = "Questo browser non supporta la posizione. Scegli un punto sulla mappa.";
+      if (forReport) setFormError(message);
+      else setToast(message);
       return;
     }
     setLocating(true);
@@ -516,7 +634,7 @@ export default function App() {
         if (forReport) setFormError(message);
         else setToast(message);
       },
-      { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 },
     );
   }
   function applyMutation(report: Report, requestRevision: number, allowAdd = false) {
@@ -580,6 +698,7 @@ export default function App() {
       };
       const { report } = await api<{ report: Report }>("/api/reports", body);
       applyMutation(report, requestRevision, true);
+      const outsideNearby = prepareReportFocus(report);
       setCategory("all");
       setQuery("");
       setMobileView("map");
@@ -589,7 +708,7 @@ export default function App() {
       setDialog(null);
       setDraft({ ...EMPTY_DRAFT });
       setDuplicateCandidates(null);
-      setToast("Segnalazione pubblicata. Grazie per il tuo contributo!");
+      setToast(outsideNearby ? "Segnalazione pubblicata. Vicino a me è stato disattivato per mostrarti il punto." : "Segnalazione pubblicata. Grazie per il tuo contributo!");
     } catch (error) {
       if (error instanceof ApiError && error.status === 409 && error.code === "POSSIBLE_DUPLICATE") {
         if (latestDraftKey.current !== requestKey) {
@@ -633,6 +752,7 @@ export default function App() {
         ?.filter((candidate) => !knownResolvedIds.current.has(candidate.id))
         .map((candidate) => candidate.id === updated.id ? updated : candidate) ?? null);
       if (fromDuplicate) {
+        const outsideNearby = prepareReportFocus(updated);
         setDialog(null);
         setDraft({ ...EMPTY_DRAFT });
         setDuplicateCandidates(null);
@@ -643,7 +763,7 @@ export default function App() {
         setSelectedId(updated.id);
         setLastSelected(updated);
         setTarget({ latitude: updated.latitude, longitude: updated.longitude, zoom: 14, key: Date.now() });
-        setToast("Segnalazione esistente confermata. Nessun duplicato pubblicato.");
+        setToast(outsideNearby ? "Segnalazione esistente confermata. Vicino a me è stato disattivato per mostrarti il punto." : "Segnalazione esistente confermata. Nessun duplicato pubblicato.");
       } else if (action === "clear") {
         setToast(updated.resolvedAt
           ? "Raggiunti i voti necessari: la segnalazione è stata rimossa dalla mappa."
@@ -768,13 +888,15 @@ export default function App() {
               <kbd>↵</kbd>
             </form>
             <button
-              className="location-button"
-              aria-label="Centra la mappa sulla mia posizione"
+              className={`location-button ${nearby ? "is-active" : ""}`}
+              aria-label={nearby ? "Aggiorna Vicino a me" : "Vicino a me"}
               title="Vicino a me"
-              onClick={() => getPosition()}
-              disabled={locating}
+              aria-pressed={Boolean(nearby)}
+              aria-busy={nearbyPending}
+              onClick={findNearby}
+              disabled={nearbyPending}
             >
-              {locating ? (
+              {nearbyPending ? (
                 <LoaderCircle className="spin" size={18} />
               ) : (
                 <LocateFixed size={18} />
@@ -801,6 +923,17 @@ export default function App() {
             </div>
           </div>
 
+          {(nearby || nearbyPending) && <div className="nearby-controls" aria-label="Filtro Vicino a me">
+            <div className="nearby-status" role="status"><LocateFixed size={18} /><div><strong>{nearbyPending ? "Ricerca della posizione…" : `Vicino a me · entro ${nearbyRadius} km`}</strong><span>{nearby ? `Posizione rilevata alle ${new Date(nearby.updatedAt).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}. Nessun tracciamento continuo.` : "La posizione viene richiesta solo per questa ricerca."}</span></div></div>
+            <div className="nearby-actions">
+              <label>Raggio<select aria-label="Raggio Vicino a me" value={nearbyRadius} disabled={nearbyPending} onChange={(event) => changeNearbyRadius(Number(event.target.value) as NearbyRadius)}><option value={5}>5 km</option><option value={10}>10 km</option><option value={25}>25 km</option></select></label>
+              {nearby && <button type="button" className="nearby-refresh" onClick={findNearby} disabled={nearbyPending}><LocateFixed size={15} />Aggiorna posizione</button>}
+              <button type="button" className="nearby-disable" onClick={disableNearby}><X size={15} />{nearby ? "Disattiva Vicino a me" : "Annulla ricerca"}</button>
+            </div>
+            <p className="nearby-scope">Il filtro usa le segnalazioni già caricate, al massimo le 500 più recenti. Il filtro è calcolato sul telefono: non inviamo le coordinate al server dell’app per questa ricerca.</p>
+          </div>}
+          {nearbyError && <div className="nearby-error" role="alert"><LocateFixed size={17} /><span>{nearbyError}</span><button type="button" onClick={findNearby}>Riprova Vicino a me</button></div>}
+
           <div className="filter-bar">
             <div
               className="category-filters"
@@ -813,7 +946,7 @@ export default function App() {
                 onClick={() => setCategory("all")}
               >
                 <span className="all-dot" />
-                Tutte<span className="filter-count">{baseReports.length}</span>
+                Tutte<span className="filter-count">{nearbyReports.length}</span>
               </button>
               {CATEGORY_KEYS.map((key) => {
                 const Icon = CATEGORIES[key].icon;
@@ -925,22 +1058,27 @@ export default function App() {
                   setDraft((previous) => ({ ...previous, position }))
                 }
                 onBoundsChange={setBounds}
+                nearby={nearby ? { ...nearby.position, radiusMeters: nearbyRadius * 1000 } : null}
               />
               <div className="map-area-label">
                 <span className="map-area-icon">
                   <MapPin size={16} />
                 </span>
                 <div>
-                  <strong>Esplora la tua prossima strada</strong>
-                  <span>Sposta la mappa per scoprire le segnalazioni</span>
+                  <strong>{nearby ? `Vicino a me · ${nearbyRadius} km` : "Esplora la tua prossima strada"}</strong>
+                  <span>{nearby ? "La lista resta nel raggio della posizione rilevata" : "Sposta la mappa per scoprire le segnalazioni"}</span>
                 </div>
               </div>
               <button
                 className="map-reset icon-button"
-                title="Torna al Lago di Garda"
-                aria-label="Torna al Lago di Garda"
+                title={nearby ? "Centra l’area Vicino a me" : "Torna al Lago di Garda"}
+                aria-label={nearby ? "Centra l’area Vicino a me" : "Torna al Lago di Garda"}
                 onClick={() =>
-                  setTarget({
+                  setTarget(nearby ? {
+                    ...nearby.position,
+                    radiusMeters: nearbyRadius * 1000,
+                    key: Date.now(),
+                  } : {
                     latitude: 45.6,
                     longitude: 10.55,
                     zoom: 10,
@@ -976,10 +1114,10 @@ export default function App() {
                   <span className="eyebrow">
                     {query.trim()
                       ? "RISULTATI DELLA RICERCA"
-                      : "AREA VISUALIZZATA"}
+                      : nearby ? `ENTRO ${nearbyRadius} KM DA TE` : "AREA VISUALIZZATA"}
                   </span>
                   <h2>
-                    Segnalazioni in zona <span>{visible.length}</span>
+                    {nearby ? "Segnalazioni vicine" : "Segnalazioni in zona"} <span>{visible.length}</span>
                   </h2>
                 </div>
                 <span
@@ -1007,6 +1145,7 @@ export default function App() {
                   >
                     <option value="recent">Più recenti</option>
                     <option value="confirmed">Più confermate</option>
+                    {nearby && <option value="distance">Più vicine</option>}
                   </select>
                   <ChevronDown size={13} />
                 </label>
@@ -1021,8 +1160,9 @@ export default function App() {
                     <p>
                       {query.trim()
                         ? "Nessuna segnalazione corrisponde alla ricerca. Prova un altro nome."
-                        : "Non ci sono segnalazioni con questi filtri. Esplora la mappa o aggiungi il tuo contributo."}
+                        : nearby ? `Nessuna segnalazione caricata entro ${nearbyRadius} km con questi filtri. Puoi aumentare il raggio o aggiornare la posizione.` : "Non ci sono segnalazioni con questi filtri. Esplora la mappa o aggiungi il tuo contributo."}
                     </p>
+                    {nearby && <div className="nearby-empty-actions"><button type="button" className="text-button" onClick={findNearby} disabled={nearbyPending}>Aggiorna posizione</button><button type="button" className="text-button" onClick={disableNearby}>Disattiva Vicino a me</button></div>}
                     <button className="text-button" onClick={openNew}>
                       Aggiungi una segnalazione <ArrowRight size={16} />
                     </button>
@@ -1057,6 +1197,7 @@ export default function App() {
                     </div>
                     <h3>{report.location}</h3>
                     <p>{report.description}</p>
+                    {nearby && <span className="card-distance"><Navigation size={13} />{formatDistance(distanceFromNearby(report))} in linea d’aria</span>}
                     {report.clearVotes > 0 && <span className="card-clear-votes">Verifica rimozione: {report.clearVotes}/{CLEAR_VOTE_THRESHOLD}</span>}
                     <div className="report-card-bottom">
                       <span className="confirmation-count">
@@ -1099,7 +1240,7 @@ export default function App() {
               <Info size={15} />
               <span>
                 {!hasExamples
-                  ? "Segnalazioni della community · visibili per 24 ore."
+                  ? "Fino a 24 ore · autovelox mobili 1 ora."
                   : showDemo
                     ? "Le segnalazioni “ESEMPIO” sono dimostrative."
                     : "Stai visualizzando solo le segnalazioni della community."}
@@ -1173,7 +1314,7 @@ export default function App() {
         </div>
       </footer>
 
-      {toast && (
+      {toast && dialog !== "new" && (
         <div className="toast" role="status">
           <CheckCheck size={20} />
           <span>{toast}</span>
@@ -1386,8 +1527,8 @@ export default function App() {
               )}
               <p className="form-privacy">
                 <ShieldCheck size={14} />
-                Condividiamo solo il punto scelto, non i tuoi spostamenti. La
-                segnalazione scade dopo 24 ore.
+                Condividiamo solo il punto scelto, non i tuoi spostamenti. Questa
+                segnalazione scade dopo {reportDuration(draft.category)}; le conferme non ne prolungano la durata.
               </p>
             </div>
             <div className={`dialog-footer ${duplicateCandidates !== null ? "duplicate-footer" : ""}`}>
@@ -1453,7 +1594,7 @@ export default function App() {
           </> : <div className="dialog-content empty-state inactive-report-state" role="status">
             {selectedHistory?.resolvedAt ? <CheckCheck size={32} /> : <CircleHelp size={32} />}
             <h3>{selectedHistory?.resolvedAt ? "La community ha indicato che non è più presente." : selectedHistory && new Date(selectedHistory.expiresAt).getTime() <= Date.now() ? "Questa segnalazione è scaduta." : "Questa segnalazione non è più attiva."}</h3>
-            <p>{selectedHistory?.resolvedAt ? `Sono stati raggiunti ${CLEAR_VOTE_THRESHOLD} voti di rimozione: il punto è stato tolto dalla mappa.` : "Potrebbe essere stata risolta dalla community o essere scaduta. Le segnalazioni restano visibili per un massimo di 24 ore."}</p>
+            <p>{selectedHistory?.resolvedAt ? `Sono stati raggiunti ${CLEAR_VOTE_THRESHOLD} voti di rimozione: il punto è stato tolto dalla mappa.` : `Potrebbe essere stata risolta dalla community o essere scaduta. La durata massima è ${selectedHistory ? reportDuration(selectedHistory.category) : "24 ore; per gli autovelox mobili è 1 ora"}.`}</p>
             {confirmError && <div className="form-error" role="alert"><TriangleAlert size={17} />{confirmError}</div>}
             <button className="primary-button" onClick={openNew}><Plus size={17} />Nuova segnalazione</button>
           </div>}
@@ -1498,8 +1639,8 @@ export default function App() {
               <div>
                 <h3>Controlla quando è stato segnalato.</h3>
                 <p>
-                  Le segnalazioni scadono dopo 24 ore; le conferme non ne
-                  prolungano la durata. Quelle contrassegnate “ESEMPIO” sono
+                  Gli autovelox mobili scadono dopo 1 ora; le altre segnalazioni
+                  dopo 24 ore. Le conferme non ne prolungano la durata. Quelle contrassegnate “ESEMPIO” sono
                   dimostrative.
                 </p>
               </div>
@@ -1538,14 +1679,18 @@ export default function App() {
           <div className="dialog-content privacy-content">
             <p>
               Passo non segue i tuoi spostamenti. Chiede la posizione soltanto
-              quando premi “Vicino a me” o “La mia posizione”, con il tuo
-              consenso nel browser.
+              quando premi “Vicino a me”, “Aggiorna posizione” o “La mia posizione”, con il tuo
+              consenso nel browser. Vicino a me calcola nel browser distanze e raggio di 5, 10 o 25 km
+              sulle segnalazioni caricate; le coordinate del filtro non vengono inviate al server dell’app per questa ricerca.
+              La posizione non si aggiorna mentre ti sposti: premi “Aggiorna posizione” quando serve.
             </p>
             <h3>Cosa viene condiviso</h3>
             <p>
               Quando pubblichi, il punto che hai scelto, il tipo di pericolo e
               la descrizione diventano visibili agli altri. Non inserire nomi,
               numeri di telefono o altri dati personali nella descrizione.
+              Gli autovelox mobili restano visibili fino a 1 ora, le altre segnalazioni fino a 24 ore;
+              le conferme non rinnovano la durata.
             </p>
             <h3>Conferme e memoria del browser</h3>
             <p>

@@ -1,6 +1,6 @@
 # Passo
 
-Una prima versione in italiano, pensata per smartphone, per segnalare **buche, ghiaia, olio, ostacoli e chiusure** sulla mappa, confermare se sono ancora presenti e indicare quando sono risolti. Inserimenti, voti e rimozioni si aggiornano nelle altre sessioni senza ricaricare la pagina.
+Una prima versione in italiano, pensata per smartphone, con dieci tipi di segnalazione: **buche, strada dissestata, ghiaia, terra, fango, olio, ostacoli, chiusure, autovelox mobile e altro pericolo**. Si può confermare se sono ancora presenti e indicare quando sono risolti. Inserimenti, voti e rimozioni si aggiornano nelle altre sessioni senza ricaricare la pagina. Per **Altro pericolo**, la descrizione deve contenere almeno dieci caratteri, esclusi gli spazi iniziali e finali.
 
 La pubblicazione prevista usa **Cloudflare Workers Free**, risorse statiche e un **Durable Object con SQLite persistente**. Non richiede un server Node a pagamento o un disco effimero. Il percorso usa il sottodominio gratuito `workers.dev`: non occorre comprare un dominio. Un account Render eventualmente creato non serve e non è necessario attivarvi servizi o dischi.
 
@@ -10,7 +10,13 @@ La pubblicazione prevista usa **Cloudflare Workers Free**, risorse statiche e un
 - Con **tre voti di risoluzione di browser distinti**, la segnalazione viene rimossa dalla mappa e dagli aggiornamenti di tutti. La risoluzione è definitiva per quella segnalazione: un nuovo pericolo richiede un nuovo inserimento. I browser non equivalgono a persone verificate; cancellare i cookie o usare altri browser può aggirare questo riconoscimento.
 - Prima di inserire una segnalazione, il server cerca altre segnalazioni community attive dello **stesso tipo entro 75 metri**. In caso di possibile duplicato restituisce fino alle tre più vicine senza inserire nuovi dati. Si può confermare quella esistente oppure proseguire esplicitamente se si tratta di un pericolo distinto. Gli esempi dimostrativi, le segnalazioni scadute e quelle risolte non bloccano l'inserimento.
 
-Nessuno dei voti prolunga la scadenza: rimane **24 ore dalla creazione**. La migrazione del database aggiunge i voti di risoluzione e il relativo stato conservando segnalazioni, conferme e sessioni già esistenti.
+Nessuno dei voti prolunga la scadenza: gli **autovelox mobili durano un'ora dalla creazione**, tutte le altre categorie **24 ore**. La migrazione delle categorie conserva segnalazioni, conferme, voti di risoluzione, stati già risolti e sessioni esistenti.
+
+## Segnalazioni vicino a me
+
+La ricerca nelle vicinanze usa la posizione richiesta al browser su azione dell'utente. Il raggio iniziale è di **10 km**, con scelta fra **5, 10 o 25 km**. Le segnalazioni sono inizialmente ordinate per distanza; si può cambiare l'ordinamento. Le coordinate usate per questo filtro restano nel browser, senza essere inviate al backend. Non è incluso un tracciamento continuo: per cambiare punto di riferimento occorre richiedere di nuovo la posizione.
+
+Il filtro e le distanze sono calcolati sui dati già ricevuti, al massimo le **500 segnalazioni attive più recenti**. Non garantiscono una ricerca completa di tutte le strade nella zona. Se il permesso di posizione viene negato o il GPS non è disponibile, la mappa e i filtri normali restano utilizzabili. La geolocalizzazione richiede un browser compatibile e HTTPS, salvo localhost per lo sviluppo; non aggiunge servizi o abbonamenti a pagamento.
 
 ## Sviluppo locale
 
@@ -71,7 +77,7 @@ npm test
 npm run build
 ```
 
-La suite include controlli isolati del backend Node e del Worker nel runtime locale: voti esclusivi e idempotenti, risoluzione definitiva, rimozione in SSE/WebSocket, duplicati e migrazione da database precedenti con riavvio. I test Cloudflare usano soltanto workerd locale e non pubblicano risorse sull'account. Un test locale riuscito non dimostra che la distribuzione online sia avvenuta. L'endpoint `/api/health` permette di distinguere il backend locale SQLite/SSE dal Worker SQLite/WebSocket.
+La suite include controlli isolati del backend Node e del Worker nel runtime locale: dieci categorie, durata degli autovelox mobili, validazione delle segnalazioni generiche, voti esclusivi e idempotenti, risoluzione definitiva, rimozione in SSE/WebSocket, duplicati e migrazione da database precedenti con vincoli SQLite e riavvio. I test Cloudflare usano soltanto workerd locale e non pubblicano risorse sull'account. Un test locale riuscito non dimostra che la distribuzione online sia avvenuta. L'endpoint `/api/health` permette di distinguere il backend locale SQLite/SSE dal Worker SQLite/WebSocket.
 
 Per il controllo funzionale usa due sessioni con cookie separati, per esempio una finestra normale e una privata: crea una segnalazione nella prima, verifica che compaia nella seconda, confermala dalla seconda e verifica l'aggiornamento nella prima. Controlla anche che una seconda conferma dallo stesso browser non aumenti il conteggio.
 
@@ -80,7 +86,7 @@ Prova poi **Non è più presente**: la conferma dello stesso browser deve essere
 ## Dati e privacy
 
 - In Cloudflare, segnalazioni, conferme e voti Risolto risiedono nello SQLite persistente di un singolo Durable Object globale; non dipendono dal filesystem temporaneo del Worker. La pubblicazione parte senza esempi.
-- Ogni segnalazione resta visibile per **24 ore dalla creazione**, oppure fino alla risoluzione se precedente. I voti non ne prolungano la durata. L'API restituisce al massimo le **500 segnalazioni attive più recenti**: ricerca e filtri operano sui dati caricati, non su un geocodificatore esterno. Il controllo dei duplicati considera anche le segnalazioni attive fuori da questo limite.
+- Gli **autovelox mobili restano visibili per un'ora dalla creazione**, le altre categorie per **24 ore**, oppure fino alla risoluzione se precedente. I voti non ne prolungano la durata. Il Worker conserva i record fino alla pulizia prevista dopo ulteriori 24 ore dalla scadenza. L'API restituisce al massimo le **500 segnalazioni attive più recenti**: ricerca, vicinanze e filtri operano sui dati caricati, non su un geocodificatore esterno. Il controllo dei duplicati considera anche le segnalazioni attive fuori da questo limite.
 - Un cookie tecnico anonimo HttpOnly, e Secure su HTTPS, riconosce i voti dello stesso browser. Non equivale a un account e non impedisce abusi da browser differenti. App e API usano la stessa origine.
 - La posizione viene richiesta soltanto su azione dell'utente, senza tracciamento continuo. Quando si pubblica vengono condivisi il punto scelto, la categoria e il testo: non inserire dati personali.
 - Prima di un lancio pubblico più ampio servono moderazione, misure antiabuso adeguate, backup e una politica di conservazione e cancellazione dei dati. La scadenza della visibilità non va confusa con una politica completa di cancellazione.

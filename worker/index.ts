@@ -1,9 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import {
+  CATEGORY_VALUES,
   CLEAR_VOTE_THRESHOLD,
+  DEFAULT_REPORT_LIFETIME_MS,
   DUPLICATE_RADIUS_METERS,
   distanceMeters,
+  reportLifetimeMs,
 } from "../shared/reportRules.js";
 
 export interface Env {
@@ -11,18 +14,22 @@ export interface Env {
   ASSETS: Fetcher;
 }
 
-const LIFETIME_MS = 24 * 60 * 60 * 1000;
+const RETENTION_MS = DEFAULT_REPORT_LIFETIME_MS;
 const COOKIE_NAME = "passo_session";
+const CATEGORY_SQL = CATEGORY_VALUES.map(category => `'${category.replaceAll("'", "''")}'`).join(",");
+const CATEGORY_SCHEMA_KEY = "categories_schema_v2";
 const encoder = new TextEncoder();
 const reportSchema = z.object({
-  category: z.enum(["pothole", "gravel", "oil", "obstacle", "closure"]),
+  category: z.enum(CATEGORY_VALUES),
   latitude: z.number().finite().min(-90).max(90),
   longitude: z.number().finite().min(-180).max(180),
   location: z.string().trim().min(3).max(140),
   description: z.string().trim().max(500).optional().default(""),
   severity: z.enum(["attention", "danger"]),
   allowDuplicate: z.boolean().optional().default(false),
-}).strict();
+}).strict().refine(data => data.category !== "other" || data.description.length >= 10, {
+  path: ["description"], message: "Per Altro, descrivi il pericolo con almeno 10 caratteri.",
+});
 
 type ReportRow = {
   id: string;
@@ -115,7 +122,7 @@ export class RoadReports extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS reports (
         id TEXT PRIMARY KEY,
-        category TEXT NOT NULL CHECK (category IN ('pothole','gravel','oil','obstacle','closure')),
+        category TEXT NOT NULL CHECK (category IN (${CATEGORY_SQL})),
         latitude REAL NOT NULL CHECK (latitude BETWEEN -90 AND 90),
         longitude REAL NOT NULL CHECK (longitude BETWEEN -180 AND 180),
         location TEXT NOT NULL,
@@ -144,9 +151,58 @@ export class RoadReports extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS reports_expiry ON reports(expires_at);
     `);
-    const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(reports)").toArray();
-    if (!columns.some(column => column.name === "resolved_at")) {
-      this.sql.exec("ALTER TABLE reports ADD COLUMN resolved_at TEXT");
+    const categoryVersion = this.sql.exec<{ value: string }>("SELECT value FROM metadata WHERE key = ?", CATEGORY_SCHEMA_KEY).toArray()[0]?.value;
+    if (categoryVersion !== "1") {
+      ctx.storage.transactionSync(() => {
+        const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(reports)").toArray();
+        if (!columns.some(column => column.name === "resolved_at")) {
+          this.sql.exec("ALTER TABLE reports ADD COLUMN resolved_at TEXT");
+        }
+        // Copies reference only the new parent. Keeping foreign keys enabled
+        // makes a failed migration roll back without dropping existing votes.
+        this.sql.exec(`
+          CREATE TABLE reports_expanded (
+            id TEXT PRIMARY KEY,
+            category TEXT NOT NULL CHECK (category IN (${CATEGORY_SQL})),
+            latitude REAL NOT NULL CHECK (latitude BETWEEN -90 AND 90),
+            longitude REAL NOT NULL CHECK (longitude BETWEEN -180 AND 180),
+            location TEXT NOT NULL,
+            description TEXT NOT NULL,
+            severity TEXT NOT NULL CHECK (severity IN ('attention','danger')),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            resolved_at TEXT
+          );
+          INSERT INTO reports_expanded
+            (id, category, latitude, longitude, location, description, severity, created_at, expires_at, resolved_at)
+            SELECT id, category, latitude, longitude, location, description, severity, created_at, expires_at, resolved_at FROM reports;
+          CREATE TABLE confirmations_expanded (
+            report_id TEXT NOT NULL REFERENCES reports_expanded(id) ON DELETE CASCADE,
+            participant_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (report_id, participant_id)
+          );
+          INSERT INTO confirmations_expanded (report_id, participant_id, created_at)
+            SELECT report_id, participant_id, created_at FROM confirmations;
+          CREATE TABLE clear_votes_expanded (
+            report_id TEXT NOT NULL REFERENCES reports_expanded(id) ON DELETE CASCADE,
+            participant_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (report_id, participant_id)
+          );
+          INSERT INTO clear_votes_expanded (report_id, participant_id, created_at)
+            SELECT report_id, participant_id, created_at FROM clear_votes;
+          DROP TABLE confirmations;
+          DROP TABLE clear_votes;
+          DROP TABLE reports;
+          ALTER TABLE reports_expanded RENAME TO reports;
+          ALTER TABLE confirmations_expanded RENAME TO confirmations;
+          ALTER TABLE clear_votes_expanded RENAME TO clear_votes;
+          CREATE INDEX reports_expiry ON reports(expires_at);
+          CREATE INDEX reports_duplicate_lookup ON reports(category, latitude, expires_at) WHERE resolved_at IS NULL;
+        `);
+        this.sql.exec("INSERT INTO metadata (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value", CATEGORY_SCHEMA_KEY);
+      });
     }
     this.sql.exec(`CREATE INDEX IF NOT EXISTS reports_duplicate_lookup
       ON reports(category, latitude, expires_at) WHERE resolved_at IS NULL`);
@@ -257,7 +313,7 @@ export class RoadReports extends DurableObject<Env> {
     const nextPurge = this.sql.exec<{ value: string | null }>("SELECT MIN(expires_at) AS value FROM reports").toArray()[0]?.value;
     const nextRate = this.sql.exec<{ value: number | null }>("SELECT MIN(reset_at) AS value FROM rate_windows").toArray()[0]?.value;
     const next = Math.min(nextExpiry ? Date.parse(nextExpiry) : Infinity,
-      nextPurge ? Date.parse(nextPurge) + LIFETIME_MS : Infinity, nextRate ?? Infinity);
+      nextPurge ? Date.parse(nextPurge) + RETENTION_MS : Infinity, nextRate ?? Infinity);
     if (Number.isFinite(next)) await this.ctx.storage.setAlarm(Math.max(now + 1000, next));
     else await this.ctx.storage.deleteAlarm();
   }
@@ -304,7 +360,7 @@ export class RoadReports extends DurableObject<Env> {
           this.sql.exec(`INSERT INTO reports
             (id, category, latitude, longitude, location, description, severity, created_at, expires_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, report.category, report.latitude, report.longitude,
-            report.location, report.description, report.severity, new Date(now).toISOString(), new Date(now + LIFETIME_MS).toISOString());
+            report.location, report.description, report.severity, new Date(now).toISOString(), new Date(now + reportLifetimeMs(report.category)).toISOString());
           return { report: this.report(id, participantId) };
         });
         if (result.duplicates) {
@@ -354,7 +410,7 @@ export class RoadReports extends DurableObject<Env> {
 
   async alarm() {
     const now = Date.now();
-    const cutoff = new Date(now - LIFETIME_MS).toISOString();
+    const cutoff = new Date(now - RETENTION_MS).toISOString();
     this.ctx.storage.transactionSync(() => {
       this.sql.exec("DELETE FROM confirmations WHERE report_id IN (SELECT id FROM reports WHERE expires_at <= ?)", cutoff);
       this.sql.exec("DELETE FROM clear_votes WHERE report_id IN (SELECT id FROM reports WHERE expires_at <= ?)", cutoff);

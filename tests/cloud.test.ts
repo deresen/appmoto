@@ -10,6 +10,7 @@ import WebSocket from "ws";
 
 interface Report {
   id: string;
+  category: string;
   source: string;
   confirmations: number;
   confirmedByMe: boolean;
@@ -408,7 +409,61 @@ test("Cloudflare: API, asset, SQLite e WebSocket reali nel runtime locale worker
   }
 });
 
-test("Cloudflare migrates actual legacy Durable Object SQLite state and retains browser identity across restarts", { timeout: 120_000 }, async () => {
+test("Cloudflare accepts ten categories in fresh SQLite, validates other hazards and keeps mobile-camera lifetime at one hour", { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "passo-cloud-categories-"));
+  await writeFile(join(directory, "wrangler.json"), JSON.stringify({
+    name: "passo-cloud-categories", main: resolve("worker/index.ts"), compatibility_date: "2026-10-19",
+    durable_objects: { bindings: [{ name: "ROAD_REPORTS", class_name: "RoadReports" }] },
+    migrations: [{ tag: "v1", new_sqlite_classes: ["RoadReports"] }],
+  }));
+  const port = await availablePort();
+  let instance: Awaited<ReturnType<typeof startWorker>> | undefined;
+  try {
+    instance = await startWorker(directory, port);
+    const author = browser(instance.base);
+    for (const description of [undefined, "", "123456789", "   123456789   "]) {
+      const invalid = await author.post("/api/reports", { ...validReport, category: "other", description });
+      assert.equal(invalid.status, 400, "generic hazards require ten description characters after trimming");
+      await invalid.json();
+    }
+    const unknown = await author.post("/api/reports", { ...validReport, category: "unknown" });
+    assert.equal(unknown.status, 400);
+    await unknown.json();
+    const created = new Map<string, Report>();
+    for (const category of ["pothole", "rough_road", "gravel", "dirt", "mud", "oil", "obstacle", "closure", "mobile_speed_camera", "other"]) {
+      const response = await author.post("/api/reports", { ...validReport, category, description: " 1234567890 " });
+      assert.equal(response.status, 201, category);
+      const { report } = await response.json();
+      assert.equal(report.category, category);
+      assert.equal(report.description, "1234567890");
+      assert.equal(Date.parse(report.expiresAt) - Date.parse(report.createdAt), category === "mobile_speed_camera" ? 3_600_000 : 86_400_000);
+      created.set(category, report);
+    }
+    const mobile = created.get("mobile_speed_camera")!;
+    const duplicate = await author.post("/api/reports", { ...validReport, category: "mobile_speed_camera" });
+    assert.equal(duplicate.status, 409);
+    assert.equal((await duplicate.json()).duplicates[0].id, mobile.id);
+    for (const action of ["confirm", "clear", "confirm"]) {
+      const response = await author.post(`/api/reports/${mobile.id}/${action}`, {});
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).report.expiresAt, mobile.expiresAt, "feedback must not renew a mobile camera's lifetime");
+    }
+    const mud = created.get("mud")!;
+    for (const voter of [author, browser(instance.base), browser(instance.base)]) {
+      const clear = await voter.post(`/api/reports/${mud.id}/clear`, {});
+      assert.equal(clear.status, 200);
+      await clear.json();
+    }
+    const reports = (await (await author.request("/api/reports")).json()).reports as Report[];
+    assert.equal(reports.length, 9);
+    assert(!reports.some(report => report.id === mud.id));
+  } finally {
+    await instance?.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Cloudflare migrates CHECK-constrained legacy SQLite with existing votes, resolution, sessions and rate limits", { timeout: 120_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "passo-cloud-legacy-"));
   const configPath = join(directory, "wrangler.json");
   const legacyPath = join(directory, "legacy.ts");
@@ -417,6 +472,7 @@ test("Cloudflare migrates actual legacy Durable Object SQLite state and retains 
   await writeFile(legacyPath, `
     import { DurableObject } from "cloudflare:workers";
     const identity = "1234567890abcdef1234567890abcdef";
+    const limitedIdentity = "22222222222222222222222222222222";
     const secret = "12".repeat(32);
     const encoder = new TextEncoder();
     const hex = value => [...new Uint8Array(value)].map(byte => byte.toString(16).padStart(2, "0")).join("");
@@ -424,12 +480,19 @@ test("Cloudflare migrates actual legacy Durable Object SQLite state and retains 
       constructor(ctx, env) {
         super(ctx, env);
         this.sql = ctx.storage.sql;
-        this.sql.exec(\`CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        this.sql.exec(\`PRAGMA foreign_keys = ON;
+          CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS reports (
-            id TEXT PRIMARY KEY, category TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL,
+            id TEXT PRIMARY KEY,
+            category TEXT NOT NULL CHECK (category IN ('pothole','gravel','oil','obstacle','closure')),
+            latitude REAL NOT NULL CHECK (latitude BETWEEN -90 AND 90),
+            longitude REAL NOT NULL CHECK (longitude BETWEEN -180 AND 180),
             location TEXT NOT NULL, description TEXT NOT NULL, severity TEXT NOT NULL,
-            created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+            created_at TEXT NOT NULL, expires_at TEXT NOT NULL, resolved_at TEXT);
           CREATE TABLE IF NOT EXISTS confirmations (
+            report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+            participant_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (report_id, participant_id));
+          CREATE TABLE IF NOT EXISTS clear_votes (
             report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
             participant_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (report_id, participant_id));
           CREATE TABLE IF NOT EXISTS rate_windows (bucket TEXT PRIMARY KEY, count INTEGER NOT NULL, reset_at INTEGER NOT NULL);
@@ -437,22 +500,33 @@ test("Cloudflare migrates actual legacy Durable Object SQLite state and retains 
       }
       async fetch() {
         const participant = hex(await crypto.subtle.digest("SHA-256", encoder.encode(identity)));
+        const limitedParticipant = hex(await crypto.subtle.digest("SHA-256", encoder.encode(limitedIdentity)));
         if (!this.sql.exec("SELECT key FROM metadata WHERE key = 'session_key'").toArray().length) {
           const now = Date.now();
           this.ctx.storage.transactionSync(() => {
             this.sql.exec("INSERT INTO metadata VALUES ('session_key', ?)", secret);
             const insert = (id, category, latitude, created, expires) => this.sql.exec(
-              "INSERT INTO reports VALUES (?, ?, ?, ?, 'Legacy road', 'Legacy report', 'attention', ?, ?)",
+              "INSERT INTO reports VALUES (?, ?, ?, ?, 'Legacy road', 'Legacy report', 'attention', ?, ?, NULL)",
               id, category, latitude, ${validReport.longitude}, new Date(created).toISOString(), new Date(expires).toISOString());
             insert("legacy-active", "pothole", ${validReport.latitude}, now - 1000, now + 86_400_000);
             insert("legacy-expired", "pothole", ${validReport.latitude + 3}, now - 90_000_000, now - 1000);
+            insert("legacy-resolved", "closure", ${validReport.latitude + 4}, now - 1000, now + 86_400_000);
+            this.sql.exec("UPDATE reports SET resolved_at = ? WHERE id = 'legacy-resolved'", new Date(now - 500).toISOString());
             for (let index = 0; index < 500; index++) insert("filler-" + index, "oil", 0, now, now + 86_400_000);
             this.sql.exec("INSERT INTO confirmations VALUES ('legacy-active', ?, ?)", participant, new Date(now).toISOString());
+            this.sql.exec("INSERT INTO clear_votes VALUES ('legacy-active', ?, ?)", "previous-clear-browser", new Date(now).toISOString());
+            for (const voter of [participant, "legacy-voter-2", "legacy-voter-3"]) {
+              this.sql.exec("INSERT INTO clear_votes VALUES ('legacy-resolved', ?, ?)", voter, new Date(now - 500).toISOString());
+            }
+            this.sql.exec("INSERT INTO rate_windows VALUES (?, 20, ?)", "create:person:" + limitedParticipant, now + 600_000);
           });
         }
         const key = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(0x12), {name:"HMAC", hash:"SHA-256"}, false, ["sign"]);
         const signature = hex(await crypto.subtle.sign("HMAC", key, encoder.encode(identity)));
-        return new Response(JSON.stringify({status:"ok",storage:"sqlite",realtime:"websocket"}), {headers:{
+        const limitedSignature = hex(await crypto.subtle.sign("HMAC", key, encoder.encode(limitedIdentity)));
+        const legacyResolvedAt = this.sql.exec("SELECT resolved_at FROM reports WHERE id = 'legacy-resolved'").toArray()[0].resolved_at;
+        return new Response(JSON.stringify({status:"ok",storage:"sqlite",realtime:"websocket", legacyResolvedAt,
+          limitedCookie:"passo_session=" + limitedIdentity + "." + limitedSignature}), {headers:{
           "Content-Type":"application/json", "Set-Cookie":"passo_session=" + identity + "." + signature + "; Path=/; HttpOnly; SameSite=Lax"
         }});
       }
@@ -470,7 +544,7 @@ test("Cloudflare migrates actual legacy Durable Object SQLite state and retains 
   try {
     instance = await startWorker(directory, port);
     const legacy = browser(instance.base);
-    await (await legacy.request("/api/health")).json();
+    const { legacyResolvedAt, limitedCookie } = await (await legacy.request("/api/health")).json();
     const cookie = legacy.cookie;
     assert(cookie.startsWith("passo_session="));
     await instance.stop();
@@ -491,16 +565,24 @@ test("Cloudflare migrates actual legacy Durable Object SQLite state and retains 
     assert.equal(legacyReport.id, "legacy-active");
     assert.equal(legacyReport.confirmations, 1);
     assert.equal(legacyReport.confirmedByMe, true);
-    assert.equal(legacyReport.clearVotes, 0);
+    assert.equal(legacyReport.clearVotes, 1, "preexisting resolution votes must survive table reconstruction");
     assert.equal(legacyReport.clearedByMe, false);
     assert.equal(legacyReport.resolvedAt, null);
     const clear = await restored.post("/api/reports/legacy-active/clear", {});
     assert.equal(clear.status, 200);
     const { report: cleared } = await clear.json();
-    assert.equal(cleared.clearVotes, 1);
+    assert.equal(cleared.clearVotes, 2);
     assert.equal(cleared.confirmations, 0);
     assert.equal(cleared.clearedByMe, true);
     assert.equal(cleared.expiresAt, legacyReport.expiresAt);
+    const oldResolved = await restored.post("/api/reports/legacy-resolved/clear", {});
+    assert.equal(oldResolved.status, 200);
+    const oldResolvedReport = (await oldResolved.json()).report;
+    assert.equal(oldResolvedReport.resolvedAt, legacyResolvedAt);
+    assert.equal(oldResolvedReport.clearVotes, 3);
+    const limitedBeforeRestart = await browser(instance.base, limitedCookie).post("/api/reports", validReport);
+    assert.equal(limitedBeforeRestart.status, 429, "migration must retain existing Durable Object rate windows");
+    await limitedBeforeRestart.json();
     for (const action of ["clear", "confirm"]) {
       const expired = await restored.post(`/api/reports/legacy-expired/${action}`, {});
       assert.equal(expired.status, 410);
@@ -516,7 +598,10 @@ test("Cloudflare migrates actual legacy Durable Object SQLite state and retains 
     assert.equal(retry.status, 200);
     assert.equal(retry.headers.get("set-cookie"), null);
     assert.deepEqual((await retry.json()).report, cleared, "clear votes and browser identity must persist across restarts");
-    for (const voter of [browser(instance.base), browser(instance.base)]) {
+    const limitedAfterRestart = await browser(instance.base, limitedCookie).post("/api/reports", validReport);
+    assert.equal(limitedAfterRestart.status, 429, "persisted limits must survive a second startup");
+    await limitedAfterRestart.json();
+    for (const voter of [browser(instance.base)]) {
       const response = await voter.post("/api/reports/legacy-active/clear", {});
       assert.equal(response.status, 200);
       await response.json();
@@ -535,6 +620,16 @@ test("Cloudflare migrates actual legacy Durable Object SQLite state and retains 
     const newReport = await restored.post("/api/reports", validReport);
     assert.equal(newReport.status, 201, "resolution must remain terminal after restart and stop blocking new reports");
     await newReport.json();
+    for (const category of ["rough_road", "dirt", "mud", "mobile_speed_camera", "other"]) {
+      const created = await restored.post("/api/reports", { ...validReport, category });
+      assert.equal(created.status, 201, `migrated Durable Object CHECK must accept ${category}`);
+      const { report } = await created.json();
+      assert.equal(report.category, category);
+      assert.equal(Date.parse(report.expiresAt) - Date.parse(report.createdAt), category === "mobile_speed_camera" ? 3_600_000 : 86_400_000);
+      const confirm = await restored.post(`/api/reports/${report.id}/confirm`, {});
+      assert.equal(confirm.status, 200, "rebuilt foreign keys must accept new confirmation rows");
+      assert.equal((await confirm.json()).report.confirmations, 1);
+    }
   } finally {
     await instance?.stop();
     await rm(directory, { recursive: true, force: true });

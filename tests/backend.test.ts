@@ -211,7 +211,7 @@ test("validates coordinates, category, text limits and malformed JSON; rejects c
     for (const data of [
       { ...validReport, latitude: 95 },
       { ...validReport, longitude: -181 },
-      { ...validReport, category: "other" },
+      { ...validReport, category: "unknown" },
       { ...validReport, description: "x".repeat(501) },
       { ...validReport, location: "  " },
       { ...validReport, extra: true },
@@ -595,7 +595,60 @@ test("duplicate checks exclude demo, expired and resolved reports, and serialize
   }
 });
 
-test("migrates a legacy SQLite database without losing reports, confirmations or signed sessions", async () => {
+test("all ten categories work on a fresh database; mobile camera expires in one hour without vote renewal", async () => {
+  let clock = Date.parse("2026-10-23T10:00:00Z");
+  const instance = await start({ dbPath: ":memory:", now: () => clock });
+  try {
+    const browser = client(instance.base);
+    for (const description of [undefined, "", "123456789", "   123456789   "]) {
+      const invalid = await browser.post("/api/reports", { ...validReport, category: "other", description });
+      assert.equal(invalid.status, 400, "other hazards need at least ten non-padding description characters");
+      await invalid.json();
+    }
+    const created = new Map<string, RoadReport>();
+    for (const category of ["pothole", "rough_road", "gravel", "dirt", "mud", "oil", "obstacle", "closure", "mobile_speed_camera", "other"]) {
+      const response = await browser.post("/api/reports", { ...validReport, category, description: " 1234567890 " });
+      assert.equal(response.status, 201, category);
+      const { report } = await response.json();
+      assert.equal(report.category, category);
+      assert.equal(report.description, "1234567890");
+      assert.equal(Date.parse(report.expiresAt) - Date.parse(report.createdAt), category === "mobile_speed_camera" ? 3_600_000 : 86_400_000);
+      created.set(category, report);
+    }
+    const mobile = created.get("mobile_speed_camera")!;
+    const duplicate = await browser.post("/api/reports", { ...validReport, category: "mobile_speed_camera" });
+    assert.equal(duplicate.status, 409);
+    assert.equal((await duplicate.json()).duplicates[0].id, mobile.id);
+    clock += 30 * 60_000;
+    for (const action of ["confirm", "clear", "confirm"]) {
+      const response = await browser.post(`/api/reports/${mobile.id}/${action}`, {});
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).report.expiresAt, mobile.expiresAt);
+    }
+    const roughRoad = created.get("rough_road")!;
+    for (const voter of [browser, client(instance.base), client(instance.base)]) {
+      const clear = await voter.post(`/api/reports/${roughRoad.id}/clear`, {});
+      assert.equal(clear.status, 200, "new categories support the same resolution feedback");
+      await clear.json();
+    }
+    clock = Date.parse(mobile.expiresAt);
+    const active = (await (await browser.request("/api/reports")).json()).reports as RoadReport[];
+    assert.equal(active.length, 8);
+    assert(!active.some(report => report.id === mobile.id || report.id === roughRoad.id));
+    for (const action of ["confirm", "clear"]) {
+      const expired = await browser.post(`/api/reports/${mobile.id}/${action}`, {});
+      assert.equal(expired.status, 410);
+      await expired.json();
+    }
+    const replacement = await browser.post("/api/reports", { ...validReport, category: "mobile_speed_camera" });
+    assert.equal(replacement.status, 201, "a mobile camera's expired location must not block a new report");
+    await replacement.json();
+  } finally {
+    await instance.close();
+  }
+});
+
+for (const withFeedback of [false, true]) test(`migrates legacy SQLite CHECK categories ${withFeedback ? "with" : "without"} existing clear votes`, async () => {
   const directory = await mkdtemp(join(tmpdir(), "appmoto-legacy-"));
   const dbPath = join(directory, "legacy.sqlite");
   const clock = Date.parse("2026-10-23T10:00:00Z");
@@ -604,27 +657,51 @@ test("migrates a legacy SQLite database without losing reports, confirmations or
   const participant = createHash("sha256").update(identity).digest("hex");
   const cookie = `passo_session=${identity}.${createHmac("sha256", legacyKey).update(identity).digest("hex")}`;
   const fixture = new DatabaseSync(dbPath);
-  // These are the schema and cookie format used before the clear-vote feature.
+  // Real previous versions constrained categories in SQLite, not only in Zod.
   fixture.exec(`
+    PRAGMA foreign_keys = ON;
     CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE reports (
-      id TEXT PRIMARY KEY, category TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL,
+      id TEXT PRIMARY KEY,
+      category TEXT NOT NULL CHECK (category IN ('pothole','gravel','oil','obstacle','closure')),
+      latitude REAL NOT NULL CHECK (latitude BETWEEN -90 AND 90),
+      longitude REAL NOT NULL CHECK (longitude BETWEEN -180 AND 180),
       location TEXT NOT NULL, description TEXT NOT NULL, severity TEXT NOT NULL,
       created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
       initial_confirmations INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL
+      ${withFeedback ? ", resolved_at TEXT" : ""}
     );
     CREATE TABLE confirmations (
       report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
       participant_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (report_id, participant_id)
     );
   `);
+  if (withFeedback) fixture.exec(`CREATE TABLE clear_votes (
+    report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+    participant_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (report_id, participant_id)
+  )`);
   fixture.prepare("INSERT INTO metadata VALUES ('session_key', ?)").run(legacyKey);
-  fixture.prepare("INSERT INTO reports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+  const insertLegacy = fixture.prepare(`INSERT INTO reports
+    (id, category, latitude, longitude, location, description, severity, created_at, expires_at, initial_confirmations, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  insertLegacy.run(
     "legacy-report", validReport.category, validReport.latitude, validReport.longitude,
     validReport.location, validReport.description, validReport.severity,
     new Date(clock).toISOString(), new Date(clock + REPORT_LIFETIME_MS).toISOString(), 4, "community",
   );
   fixture.prepare("INSERT INTO confirmations VALUES (?, ?, ?)").run("legacy-report", participant, new Date(clock).toISOString());
+  insertLegacy.run("legacy-demo", "oil", 44, 9, "Legacy demo", "Example", "attention",
+    new Date(clock).toISOString(), new Date(clock + REPORT_LIFETIME_MS).toISOString(), 7, "demo");
+  const resolvedAt = new Date(clock - 500).toISOString();
+  if (withFeedback) {
+    fixture.prepare("INSERT INTO clear_votes VALUES (?, ?, ?)").run("legacy-report", "another-legacy-browser", new Date(clock).toISOString());
+    insertLegacy.run("legacy-resolved", "closure", 43, 8, "Legacy resolved", "Closed report", "attention",
+      new Date(clock - 1000).toISOString(), new Date(clock + REPORT_LIFETIME_MS).toISOString(), 0, "community");
+    fixture.prepare("UPDATE reports SET resolved_at = ? WHERE id = 'legacy-resolved'").run(resolvedAt);
+    for (const voter of [participant, "legacy-voter-2", "legacy-voter-3"]) {
+      fixture.prepare("INSERT INTO clear_votes VALUES ('legacy-resolved', ?, ?)").run(voter, resolvedAt);
+    }
+  }
   fixture.close();
   let instance: Awaited<ReturnType<typeof start>> | undefined;
   try {
@@ -633,25 +710,35 @@ test("migrates a legacy SQLite database without losing reports, confirmations or
     const listing = await oldBrowser.request("/api/reports");
     assert.equal(listing.headers.get("set-cookie"), null, "migration must retain the signing key");
     const { reports } = await listing.json();
-    assert.equal(reports.length, 1);
-    assert.equal(reports[0].id, "legacy-report");
-    assert.equal(reports[0].confirmations, 5);
-    assert.equal(reports[0].confirmedByMe, true);
-    assert.equal(reports[0].clearVotes, 0);
-    assert.equal(reports[0].clearedByMe, false);
-    assert.equal(reports[0].resolvedAt, null);
+    assert.equal(reports.length, 2);
+    const active = reports.find((report: RoadReport) => report.id === "legacy-report");
+    assert.equal(active.confirmations, 5);
+    assert.equal(active.confirmedByMe, true);
+    assert.equal(active.clearVotes, withFeedback ? 1 : 0);
+    assert.equal(active.clearedByMe, false);
+    assert.equal(active.resolvedAt, null);
+    const demo = reports.find((report: RoadReport) => report.id === "legacy-demo");
+    assert.equal(demo.source, "demo");
+    assert.equal(demo.confirmations, 7);
+    if (withFeedback) {
+      const oldResolved = await oldBrowser.post("/api/reports/legacy-resolved/clear", {});
+      assert.equal(oldResolved.status, 200);
+      assert.equal((await oldResolved.json()).report.resolvedAt, resolvedAt);
+    }
     const changed = await oldBrowser.post("/api/reports/legacy-report/clear", {});
     assert.equal(changed.status, 200);
     const { report } = await changed.json();
     assert.equal(report.confirmations, 4);
-    assert.equal(report.clearVotes, 1);
+    assert.equal(report.clearVotes, withFeedback ? 2 : 1);
     assert.equal(report.clearedByMe, true);
     await instance.close();
     instance = await start({ dbPath, now: () => clock });
     const restored = await client(instance.base, cookie).request("/api/reports");
     assert.equal(restored.headers.get("set-cookie"), null);
-    assert.deepEqual((await restored.json()).reports, [report]);
-    for (const voter of [client(instance.base), client(instance.base)]) {
+    const restoredReports = (await restored.json()).reports;
+    assert.deepEqual(restoredReports.find((item: RoadReport) => item.id === "legacy-report"), report);
+    assert.deepEqual(restoredReports.find((item: RoadReport) => item.id === "legacy-demo"), demo);
+    for (const voter of Array.from({ length: withFeedback ? 1 : 2 }, () => client(instance!.base))) {
       const response = await voter.post("/api/reports/legacy-report/clear", {});
       assert.equal(response.status, 200);
       await response.json();
@@ -659,10 +746,31 @@ test("migrates a legacy SQLite database without losing reports, confirmations or
     await instance.close();
     instance = await start({ dbPath, now: () => clock });
     const browser = client(instance.base, cookie);
-    assert.deepEqual(await (await browser.request("/api/reports")).json(), { reports: [] });
+    assert.deepEqual((await (await browser.request("/api/reports")).json()).reports, [demo]);
     const retry = await browser.post("/api/reports/legacy-report/clear", {});
     assert.equal(retry.status, 200);
     assert.equal((await retry.json()).report.clearVotes, 3);
+    for (const category of ["rough_road", "dirt", "mud", "mobile_speed_camera", "other"]) {
+      const created = await browser.post("/api/reports", { ...validReport, category });
+      assert.equal(created.status, 201, `migrated SQLite CHECK must accept ${category}`);
+      const { report: inserted } = await created.json();
+      assert.equal(inserted.category, category);
+      assert.equal(Date.parse(inserted.expiresAt) - Date.parse(inserted.createdAt), category === "mobile_speed_camera" ? 3_600_000 : 86_400_000);
+      const confirmation = await browser.post(`/api/reports/${inserted.id}/confirm`, {});
+      assert.equal(confirmation.status, 200, "rebuilt confirmation foreign keys must reference the rebuilt report table");
+      await confirmation.json();
+    }
+    const migrated = new DatabaseSync(dbPath);
+    try {
+      assert.deepEqual(migrated.prepare("PRAGMA foreign_key_check").all(), []);
+      for (const table of ["confirmations", "clear_votes"]) {
+        const foreignKeys = migrated.prepare(`PRAGMA foreign_key_list(${table})`).all() as { table: string }[];
+        assert(foreignKeys.some(key => key.table === "reports"), `${table} must retain its reports foreign key`);
+      }
+      assert.equal((migrated.prepare("SELECT value FROM metadata WHERE key = 'session_key'").get() as { value: string }).value, legacyKey);
+    } finally {
+      migrated.close();
+    }
   } finally {
     await instance?.close();
     await rm(directory, { recursive: true, force: true });

@@ -1,4 +1,5 @@
-export type Category = "pothole" | "gravel" | "oil" | "obstacle" | "closure";
+export type { Category } from "../shared/reportRules";
+import type { Category } from "../shared/reportRules";
 export type Severity = "attention" | "danger";
 export type Report = {
   id: string;

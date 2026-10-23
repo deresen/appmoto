@@ -15,20 +15,18 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import {
+  CATEGORY_VALUES,
   CLEAR_VOTE_THRESHOLD,
+  DEFAULT_REPORT_LIFETIME_MS,
   DUPLICATE_RADIUS_METERS,
   distanceMeters,
+  reportLifetimeMs,
 } from "../shared/reportRules.js";
 
-export const REPORT_LIFETIME_MS = 24 * 60 * 60 * 1000;
+export const REPORT_LIFETIME_MS = DEFAULT_REPORT_LIFETIME_MS;
 const COOKIE_NAME = "passo_session";
-const CATEGORY_VALUES = [
-  "pothole",
-  "gravel",
-  "oil",
-  "obstacle",
-  "closure",
-] as const;
+const CATEGORY_SQL = CATEGORY_VALUES.map(category => `'${category.replaceAll("'", "''")}'`).join(",");
+const CATEGORY_SCHEMA_KEY = "categories_schema_v2";
 
 export interface RoadReport {
   id: string;
@@ -85,7 +83,10 @@ const reportSchema = z
     severity: z.enum(["attention", "danger"]),
     allowDuplicate: z.boolean().optional().default(false),
   })
-  .strict();
+  .strict()
+  .refine(data => data.category !== "other" || data.description.length >= 10, {
+    path: ["description"], message: "Per Altro, descrivi il pericolo con almeno 10 caratteri.",
+  });
 
 export function createApp(options: AppOptions = {}) {
   const now = options.now ?? Date.now;
@@ -102,7 +103,7 @@ export function createApp(options: AppOptions = {}) {
     CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS reports (
       id TEXT PRIMARY KEY,
-      category TEXT NOT NULL CHECK (category IN ('pothole','gravel','oil','obstacle','closure')),
+      category TEXT NOT NULL CHECK (category IN (${CATEGORY_SQL})),
       latitude REAL NOT NULL CHECK (latitude BETWEEN -90 AND 90),
       longitude REAL NOT NULL CHECK (longitude BETWEEN -180 AND 180),
       location TEXT NOT NULL,
@@ -128,9 +129,67 @@ export function createApp(options: AppOptions = {}) {
     );
     CREATE INDEX IF NOT EXISTS reports_expiry ON reports(expires_at);
   `);
-  const reportColumns = db.prepare("PRAGMA table_info(reports)").all() as { name: string }[];
-  if (!reportColumns.some(column => column.name === "resolved_at")) {
-    db.exec("ALTER TABLE reports ADD COLUMN resolved_at TEXT");
+  const categoryVersion = db.prepare("SELECT value FROM metadata WHERE key = ?").get(CATEGORY_SCHEMA_KEY) as { value: string } | undefined;
+  if (categoryVersion?.value !== "1") {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const reportColumns = db.prepare("PRAGMA table_info(reports)").all() as { name: string }[];
+      if (!reportColumns.some(column => column.name === "resolved_at")) {
+        db.exec("ALTER TABLE reports ADD COLUMN resolved_at TEXT");
+      }
+      // New children reference the new parent. Drop every old child before
+      // dropping its parent so active foreign keys cannot cascade into copies.
+      db.exec(`
+        CREATE TABLE reports_expanded (
+          id TEXT PRIMARY KEY,
+          category TEXT NOT NULL CHECK (category IN (${CATEGORY_SQL})),
+          latitude REAL NOT NULL CHECK (latitude BETWEEN -90 AND 90),
+          longitude REAL NOT NULL CHECK (longitude BETWEEN -180 AND 180),
+          location TEXT NOT NULL,
+          description TEXT NOT NULL,
+          severity TEXT NOT NULL CHECK (severity IN ('attention','danger')),
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          resolved_at TEXT,
+          initial_confirmations INTEGER NOT NULL DEFAULT 0,
+          source TEXT NOT NULL CHECK (source IN ('community','demo'))
+        );
+        INSERT INTO reports_expanded
+          (id, category, latitude, longitude, location, description, severity, created_at, expires_at, resolved_at, initial_confirmations, source)
+          SELECT id, category, latitude, longitude, location, description, severity, created_at, expires_at, resolved_at, initial_confirmations, source FROM reports;
+        CREATE TABLE confirmations_expanded (
+          report_id TEXT NOT NULL REFERENCES reports_expanded(id) ON DELETE CASCADE,
+          participant_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (report_id, participant_id)
+        );
+        INSERT INTO confirmations_expanded (report_id, participant_id, created_at)
+          SELECT report_id, participant_id, created_at FROM confirmations;
+        CREATE TABLE clear_votes_expanded (
+          report_id TEXT NOT NULL REFERENCES reports_expanded(id) ON DELETE CASCADE,
+          participant_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (report_id, participant_id)
+        );
+        INSERT INTO clear_votes_expanded (report_id, participant_id, created_at)
+          SELECT report_id, participant_id, created_at FROM clear_votes;
+        DROP TABLE confirmations;
+        DROP TABLE clear_votes;
+        DROP TABLE reports;
+        ALTER TABLE reports_expanded RENAME TO reports;
+        ALTER TABLE confirmations_expanded RENAME TO confirmations;
+        ALTER TABLE clear_votes_expanded RENAME TO clear_votes;
+        CREATE INDEX reports_expiry ON reports(expires_at);
+        CREATE INDEX reports_duplicate_lookup ON reports(category, latitude, expires_at)
+          WHERE resolved_at IS NULL AND source = 'community';
+      `);
+      db.prepare("INSERT INTO metadata (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(CATEGORY_SCHEMA_KEY);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      db.close();
+      throw error;
+    }
   }
   db.exec(`CREATE INDEX IF NOT EXISTS reports_duplicate_lookup
     ON reports(category, latitude, expires_at) WHERE resolved_at IS NULL AND source = 'community'`);
@@ -239,7 +298,7 @@ export function createApp(options: AppOptions = {}) {
           description,
           severity,
           new Date(createdAt).toISOString(),
-          new Date(createdAt + REPORT_LIFETIME_MS).toISOString(),
+          new Date(createdAt + reportLifetimeMs(category)).toISOString(),
           confirmations,
           "demo",
         );
@@ -502,7 +561,7 @@ export function createApp(options: AppOptions = {}) {
       }
       insertReport.run(
         id, data.category, data.latitude, data.longitude, data.location, data.description, data.severity,
-        new Date(createdAt).toISOString(), new Date(createdAt + REPORT_LIFETIME_MS).toISOString(), 0, "community",
+        new Date(createdAt).toISOString(), new Date(createdAt + reportLifetimeMs(data.category)).toISOString(), 0, "community",
       );
       report = reportFor(id, res.locals.participantId);
       db.exec("COMMIT");
