@@ -266,15 +266,71 @@ export default function App() {
   useEffect(() => {
     let active = true;
     let events: EventSource | null = null;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | undefined;
+    let heartbeat: number | undefined;
+    let reconnects = 0;
     setLoading(true);
     setLoadError("");
     setConnection("connecting");
+    function receiveSnapshot(value: string) {
+      if (!active || value === "pong") return;
+      try {
+        const data = JSON.parse(value) as { reports?: Report[] };
+        if (Array.isArray(data.reports)) {
+          setReports(data.reports);
+          setConnection("live");
+        }
+      } catch {
+        setConnection("offline");
+      }
+    }
+    function connectWebSocket() {
+      if (!active) return;
+      const url = new URL("/api/events", window.location.href);
+      url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const current = new WebSocket(url);
+      socket = current;
+      current.onopen = () => {
+        if (!active || socket !== current) return;
+        reconnects = 0;
+        setConnection("live");
+        window.clearInterval(heartbeat);
+        heartbeat = window.setInterval(() => {
+          if (current.readyState === WebSocket.OPEN) current.send("ping");
+        }, 25000);
+      };
+      current.onmessage = (event) => {
+        if (socket === current && typeof event.data === "string")
+          receiveSnapshot(event.data);
+      };
+      current.onerror = () => {
+        if (active && socket === current) setConnection("offline");
+      };
+      current.onclose = () => {
+        window.clearInterval(heartbeat);
+        if (!active || socket !== current) return;
+        setConnection("offline");
+        reconnectTimer = window.setTimeout(
+          connectWebSocket,
+          Math.min(1000 * 2 ** reconnects++, 10000),
+        );
+      };
+    }
     async function connect() {
       try {
         const initial = await api<{ reports: Report[] }>("/api/reports");
         if (!active) return;
         setReports(initial.reports);
         setLoading(false);
+        const health = await api<{ realtime: "sse" | "websocket" }>(
+          "/api/health",
+        );
+        if (!active) return;
+        if (health.realtime === "websocket") {
+          connectWebSocket();
+          return;
+        }
         events = new EventSource("/api/events", { withCredentials: true });
         events.onopen = () => {
           if (active) setConnection("live");
@@ -283,18 +339,7 @@ export default function App() {
           if (active) setConnection("offline");
         };
         events.addEventListener("reports", (event) => {
-          if (!active) return;
-          try {
-            const data = JSON.parse((event as MessageEvent).data) as {
-              reports: Report[];
-            };
-            if (Array.isArray(data.reports)) {
-              setReports(data.reports);
-              setConnection("live");
-            }
-          } catch {
-            setConnection("offline");
-          }
+          receiveSnapshot((event as MessageEvent).data);
         });
       } catch (error) {
         if (active) {
@@ -312,6 +357,9 @@ export default function App() {
     return () => {
       active = false;
       events?.close();
+      window.clearTimeout(reconnectTimer);
+      window.clearInterval(heartbeat);
+      socket?.close();
     };
   }, [reload]);
 
@@ -328,6 +376,7 @@ export default function App() {
   const activeReports = reports.filter(
     (report) => new Date(report.expiresAt).getTime() > Date.now(),
   );
+  const hasExamples = reports.some((report) => report.source === "demo");
   const baseReports = activeReports.filter(
     (report) => showDemo || report.source !== "demo",
   );
@@ -919,13 +968,17 @@ export default function App() {
             <div className="demo-note">
               <Info size={15} />
               <span>
-                {showDemo
-                  ? "Le segnalazioni “ESEMPIO” sono dimostrative."
-                  : "Stai visualizzando solo le segnalazioni della community."}
+                {!hasExamples
+                  ? "Segnalazioni della community · visibili per 24 ore."
+                  : showDemo
+                    ? "Le segnalazioni “ESEMPIO” sono dimostrative."
+                    : "Stai visualizzando solo le segnalazioni della community."}
               </span>
-              <button onClick={() => setShowDemo((value) => !value)}>
-                {showDemo ? "Nascondi esempi" : "Mostra esempi"}
-              </button>
+              {hasExamples && (
+                <button onClick={() => setShowDemo((value) => !value)}>
+                  {showDemo ? "Nascondi esempi" : "Mostra esempi"}
+                </button>
+              )}
             </div>
             <span className="community-total">
               <ShieldCheck size={15} />

@@ -1,12 +1,12 @@
 # Passo
 
-Una prima versione, in italiano e pensata per smartphone, per condividere le condizioni delle strade. La mappa raccoglie segnalazioni geolocalizzate di **buche, ghiaia, olio, ostacoli e chiusure**. Gli altri utenti possono confermare che una segnalazione è ancora presente; inserimenti e conferme si aggiornano nelle altre sessioni tramite Server-Sent Events (SSE).
+Una prima versione in italiano, pensata per smartphone, per segnalare **buche, ghiaia, olio, ostacoli e chiusure** sulla mappa e confermare se sono ancora presenti. Inserimenti e conferme si aggiornano nelle altre sessioni senza ricaricare la pagina.
 
-I punti contrassegnati come **ESEMPIO** servono a esplorare l'interfaccia: non descrivono condizioni stradali verificate. Nel database la loro origine è `demo`. Passo è un prototipo, non un servizio di emergenza o uno strumento di navigazione.
+La pubblicazione prevista usa **Cloudflare Workers Free**, risorse statiche e un **Durable Object con SQLite persistente**. Non richiede un server Node a pagamento o un disco effimero. Il percorso usa il sottodominio gratuito `workers.dev`: non occorre comprare un dominio. Un account Render eventualmente creato non serve e non è necessario attivarvi servizi o dischi.
 
-## Avvio locale
+## Sviluppo locale
 
-Sono necessari **Node.js 24 o successivo** e npm. Il backend usa SQLite integrato in Node.js: non occorre installare un database separato.
+Servono **Node.js 24+** e npm:
 
 ```bash
 cd /workspace/appmoto
@@ -14,31 +14,46 @@ npm ci
 npm run dev
 ```
 
-Se, in questo ambiente cloud, la cache npm predefinita non è scrivibile, usa `npm ci --cache /tmp/passo-npm-cache` al posto di `npm ci`. Non occorre modificare il lockfile o disattivare verifiche di integrità.
+Vite usa la porta `5173`, con proxy `/api` verso Node sulla `3001`. Questo percorso locale usa SQLite in `data/appmoto.sqlite` e aggiornamenti SSE. Al primo avvio del database aggiunge sei segnalazioni **ESEMPIO**; non sono condizioni stradali reali. `SEED_DEMO=0` o `false` impedisce l'inserimento iniziale, senza eliminare o rinnovare gli esempi già salvati. `DATA_DIR` cambia la cartella dati; `PORT`, se presente, precede `API_PORT`. `.env.example` descrive le variabili: il server Node non carica automaticamente `.env`.
 
-Il server Vite è sulla porta `5173` e inoltra le richieste `/api` al backend sulla porta `3001`. Per accedere da un altro dispositivo, usa un indirizzo raggiungibile del computer che esegue il progetto. La geolocalizzazione del browser richiede HTTPS, salvo l'eccezione locale prevista dai browser.
+Se la cache npm predefinita non è scrivibile nell'ambiente cloud, usa `npm ci --cache /tmp/passo-npm-cache`.
 
-Per creare ed eseguire la build:
+Per provare lo stesso runtime previsto per la pubblicazione:
 
 ```bash
-npm run build
-npm start
+npm run dev:cloud
 ```
 
-In questa modalità il backend serve anche l'interfaccia compilata dalla cartella `dist`, sulla porta `3001` predefinita. La porta è scelta da `PORT` se presente, altrimenti da `API_PORT`; `PORT` è usata dagli hosting come Render.
+Wrangler esegue la build configurata e avvia l'app sulla porta `8787`, con API, risorse statiche, SQLite del Durable Object e WebSocket Hibernation. Lo stato di sviluppo è locale: non è il database online e non viene trasferito automaticamente alla pubblicazione. Questo percorso parte senza dati dimostrativi.
 
-## Pubblicazione su Render
+`npm run build && npm start` resta disponibile per eseguire la build con il backend Node locale sulla porta `3001`; non è il comando di distribuzione su Cloudflare.
 
-È predisposto [`render.yaml`](render.yaml) per un singolo server Node.js in Europa e un disco persistente da 1 GB. **Il servizio Starter e il disco sono a pagamento**: controlla il prezzo mostrato da Render prima di applicare la configurazione. Creare l'account non pubblica l'app e non attiva da solo queste risorse.
+## Pubblicazione gratuita
 
-1. Crea un account su [Render](https://dashboard.render.com/register) usando GitHub.
-2. Salva il codice del progetto nel repository `deresen/appmoto`, sul branch `main`. Il codice presente soltanto nel workspace cloud non è ancora disponibile a Render. Prima di eseguire un push verifica le modifiche e l'autorizzazione a inviarle al repository; non includere `.env`, database o credenziali.
-3. Nella dashboard Render crea una **Blueprint** dal repository. Il file configura il comando di build, l'avvio, HTTPS tramite Render e il volume in `/var/data`. Rivedi servizio, disco e costi, poi conferma la creazione.
-4. Quando Render indica che il servizio è attivo, apri l'indirizzo HTTPS assegnato dal servizio dal telefono. Verifica mappa e inserimento, poi apri una seconda sessione per controllare le conferme in tempo reale. Un risultato positivo in locale non dimostra che questa distribuzione sia già riuscita.
+Non è stata ancora verificata una distribuzione sull'account Cloudflare dell'utente. Per pubblicare occorre creare o usare il proprio account e mantenere il piano **Workers Free**, senza attivare Workers Paid o altri prodotti a pagamento.
 
-La build installa le dipendenze di sviluppo per TypeScript/Vite e poi le rimuove. `tsx` rimane fra le dipendenze di produzione perché `npm start` lo usa per eseguire il backend. In produzione i cookie tecnici usano `Secure`; `TRUST_PROXY=1` abilita la fiducia in un solo proxy davanti al server. Attivala soltanto su un hosting con ingress controllato: non è adatta a un server direttamente esposto a richieste con intestazioni inoltrate arbitrarie. Non vengono accettati siti esterni tramite CORS.
+1. Salva il codice nel repository GitHub `deresen/appmoto`. Il codice presente soltanto nel workspace non è disponibile alla piattaforma di pubblicazione; escludi database, `.env` e credenziali.
+2. Nel [dashboard Cloudflare](https://dash.cloudflare.com/) apri **Workers & Pages → Create application → GitHub**, autorizza il collegamento e scegli il repository.
+3. Il nome del Worker deve corrispondere a `name` in `wrangler.jsonc`. Usa `npm run deploy` come comando di distribuzione: Wrangler esegue la build personalizzata configurata. Workers Builds gestisce l'autenticazione nel dashboard; non occorre incollare un token in chat.
+4. Apri l'URL HTTPS `workers.dev` assegnato. Verifica la mappa, pubblica una segnalazione e confermala da una seconda sessione con cookie separati. Controlla gli aggiornamenti senza ricaricare e la permanenza del dato dopo una nuova visita o distribuzione.
 
-Il disco mantiene segnalazioni, conferme e identità del browser fra riavvii. Non aggiungere repliche: SQLite e SSE sono configurati per un solo processo. La configurazione pubblica usa `SEED_DEMO=0`, quindi un database nuovo parte senza segnalazioni dimostrative. Le pubblicazioni automatiche sono disattivate: i successivi aggiornamenti si avviano dalla dashboard Render.
+In alternativa, dalla propria macchina si può eseguire `npx wrangler login` e poi `npm run deploy`. Il login avviene nel browser con il proprio account. Non serve un servizio realtime separato né una sua chiave API.
+
+### Quote del piano Free
+
+Le quote verificate nella documentazione ufficiale sono condivise a livello di account. Restando sul piano Free non ci sono costi di abbonamento per queste risorse: **al superamento di una quota gratuita le relative operazioni si fermano con un errore**, anziché essere fatturate come consumo aggiuntivo. I limiti giornalieri si ripristinano alle `00:00 UTC`. Non è un servizio illimitato e le condizioni del fornitore possono cambiare.
+
+| Risorsa                                           | Quota Free documentata                                                     |
+| ------------------------------------------------- | -------------------------------------------------------------------------- |
+| Worker dinamico                                   | 100.000 richieste/giorno, 10 ms di CPU per invocazione                     |
+| Risorse statiche servite senza invocare il Worker | Richieste gratuite e illimitate; nessun costo aggiuntivo di archiviazione  |
+| Durable Objects                                   | 100.000 richieste/giorno e 13.000 GB-s/giorno di durata attiva             |
+| SQLite dei Durable Objects                        | 5 milioni di righe lette/giorno, 100.000 righe scritte/giorno, 5 GB totali |
+| Workers Builds                                    | 3.000 minuti/mese, una build contemporanea, timeout di 20 minuti           |
+
+Il realtime usa l'API **WebSocket Hibernation** per consentire all'oggetto di dormire quando inattivo lasciando collegati i client. Le richieste e l'attività continuano comunque a consumare le quote previste. Questa configurazione non attiva un passaggio automatico a un piano a pagamento.
+
+Fonti: [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/), [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), [Static Assets](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/), [Builds limits](https://developers.cloudflare.com/workers/ci-cd/builds/limits-and-pricing/), [Git integration e pubblicazione](https://developers.cloudflare.com/workers/ci-cd/builds/), [WebSocket Hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
 
 ## Verifiche
 
@@ -48,35 +63,22 @@ npm test
 npm run build
 ```
 
-La suite del backend usa un database isolato. Per verificare il flusso completo, apri due sessioni con cookie separati, per esempio una finestra normale e una privata. Inserisci una segnalazione dalla prima e verifica che compaia nella seconda senza ricaricare. Confermala dalla seconda sessione e verifica l'aggiornamento del conteggio nella prima. Un browser non può confermare ripetutamente la stessa segnalazione.
+La suite include controlli isolati del backend Node e del Worker nel runtime locale. Un test locale riuscito non dimostra che la distribuzione online sia avvenuta. L'endpoint `/api/health` permette di distinguere il backend locale SQLite/SSE dal Worker SQLite/WebSocket.
 
-## Dati e aggiornamenti in tempo reale
+Per il controllo funzionale usa due sessioni con cookie separati, per esempio una finestra normale e una privata: crea una segnalazione nella prima, verifica che compaia nella seconda, confermala dalla seconda e verifica l'aggiornamento nella prima. Controlla anche che una seconda conferma dallo stesso browser non aumenti il conteggio.
 
-- I dati sono salvati in `data/appmoto.sqlite`. La variabile `DATA_DIR` permette di scegliere una cartella diversa; `PORT` o, in sua assenza, `API_PORT` modifica la porta del backend.
-- Conserva la cartella dati su un volume persistente durante la distribuzione. Cancellarla elimina anche segnalazioni e conferme.
-- Ogni browser riceve un identificatore anonimo in un cookie HttpOnly. Serve a evitare conferme duplicate nello stesso browser; non equivale a un account verificato e non impedisce abusi da browser diversi.
-- SSE mantiene sincronizzate le sessioni collegate allo stesso server. Il proxy di distribuzione deve consentire connessioni HTTP persistenti e non accumulare il flusso SSE in un buffer.
-- Ogni segnalazione scade **24 ore dopo la creazione**. Le conferme non ne prolungano la durata. Le informazioni non devono essere considerate certe o permanenti e la conferma della community non sostituisce una verifica sul posto.
-- L'API e il flusso SSE restituiscono al massimo le **500 segnalazioni attive più recenti**. Ricerca e filtri operano su queste segnalazioni caricate; la ricerca non cerca indirizzi esterni o località prive di segnalazioni. Non sono ancora disponibili paginazione o ricerca geografica sul server.
-- Al primo avvio vengono aggiunte alcune segnalazioni di esempio. Per impedirlo su un database non ancora inizializzato, avvia con `SEED_DEMO=0 npm run dev` oppure `SEED_DEMO=0 npm start`. Anche `SEED_DEMO=false` disabilita l'inserimento. La variabile non elimina esempi già salvati e non li aggiorna: gli esempi vengono inseriti una sola volta per database e scadono come le altre segnalazioni.
+## Dati e privacy
 
-## Servizi esterni necessari
+- In Cloudflare, segnalazioni e conferme risiedono nello SQLite persistente di un singolo Durable Object globale; non dipendono dal filesystem temporaneo del Worker. La pubblicazione parte senza esempi.
+- Ogni segnalazione resta visibile per **24 ore dalla creazione**. Le conferme non ne prolungano la durata. L'API restituisce al massimo le **500 segnalazioni attive più recenti**: ricerca e filtri operano sui dati caricati, non su un geocodificatore esterno.
+- Un cookie tecnico anonimo HttpOnly, e Secure su HTTPS, riconosce le conferme dello stesso browser. Non equivale a un account e non impedisce abusi da browser differenti. App e API usano la stessa origine.
+- La posizione viene richiesta soltanto su azione dell'utente, senza tracciamento continuo. Quando si pubblica vengono condivisi il punto scelto, la categoria e il testo: non inserire dati personali.
+- Prima di un lancio pubblico più ampio servono moderazione, misure antiabuso adeguate, backup e una politica di conservazione e cancellazione dei dati. La scadenza della visibilità non va confusa con una politica completa di cancellazione.
 
-| Servizio          | Uso nella prima versione                       | Requisiti                                                                                             |
-| ----------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| OpenStreetMap     | Immagini della mappa richieste dal browser     | Connessione Internet HTTPS a `tile.openstreetmap.org`; attribuzione visibile a OpenStreetMap.         |
-| Un server Node.js | API, aggiornamenti SSE e interfaccia compilata | Node.js 24+, HTTPS, volume persistente per SQLite. Può essere il computer locale durante lo sviluppo. |
+## Mappa e limiti del prototipo
 
-Non sono necessari account o chiavi di un servizio realtime: gli aggiornamenti passano dal backend dell'app. Non sono integrati servizi di navigazione, calcolo dei percorsi o geocodifica esterna.
+Le immagini della mappa arrivano dal servizio pubblico **OpenStreetMap** su `https://tile.openstreetmap.org`, senza chiave API. Il browser deve poter raggiungere il dominio e l'attribuzione deve rimanere visibile. Il servizio è best effort: rispetta la [Tile Usage Policy](https://operations.osmfoundation.org/policies/tiles/), la cache e il divieto di scaricamento in massa o per uso offline. Non è una garanzia di capacità gratuita illimitata per un'app in crescita.
 
-Nell'istanza cloud usata per lo sviluppo, `tile.openstreetmap.org` è stato aggiunto ai domini consentiti e l'accesso al servizio è stato verificato ricevendo una vera immagine cartografica. La verifica delle immagini nel browser automatico resta incompleta: quel browser non riconosce il certificato del proxy della macchina. Non sono state disattivate verifiche TLS né modificati i certificati di fiducia globali. Questo limite riguarda il browser automatico di questa macchina; la visualizzazione dovrà essere verificata anche sul dominio HTTPS effettivamente pubblicato. Su una distribuzione ordinaria è necessaria la connettività Internet del browser verso il dominio delle immagini.
+Nell'ambiente cloud di sviluppo è stata verificata una vera immagine cartografica via HTTPS. La verifica delle immagini nel browser automatico resta limitata dal certificato del proxy di quella macchina; non sono state disattivate le verifiche TLS. La mappa va verificata anche sul dominio pubblicato.
 
-Le tile pubbliche OpenStreetMap sono adatte a un uso contenuto e soggette alla [Tile Usage Policy](https://operations.osmfoundation.org/policies/tiles/): mantieni l'attribuzione, rispetta le intestazioni di cache e non scaricare mappe in massa o per l'uso offline. Per un lancio pubblico e traffico significativo, scegli un fornitore di mappe con un piano adeguato, per esempio MapTiler, e configura il relativo URL e l'eventuale chiave. Il piano, la chiave e i domini consentiti dipendono dal fornitore scelto.
-
-## Privacy e limiti prima del lancio pubblico
-
-La posizione viene richiesta solo su azione dell'utente; non è previsto un tracciamento continuo. La posizione scelta e il testo inviati con una segnalazione vengono salvati e mostrati agli altri utenti. Evita nomi, targhe e altri dati personali nel testo libero.
-
-Questa versione è progettata per un singolo processo server. Prima di aprirla al pubblico servono una valutazione delle misure antiabuso, moderazione, autenticazione adeguata al prodotto, backup e una politica di conservazione dei dati. Per più istanze occorrono un database condiviso e un canale pub/sub per distribuire gli eventi fra server. Le identità anonime del prototipo non garantiscono l'attendibilità delle segnalazioni.
-
-Il manifest permette l'apertura in modalità standalone sui dispositivi compatibili. Non è inclusa una modalità offline e i dati della mappa richiedono la rete.
+Il manifest permette la modalità standalone sui dispositivi compatibili; non è inclusa una modalità offline. Le informazioni della community non sono verificate: Passo non sostituisce la segnaletica, la navigazione o i servizi di emergenza. Segnala solo dopo esserti fermato.
