@@ -1,0 +1,52 @@
+.advertising-banner {
+  width: 100%;
+  max-width: 1200px;
+  margin: 24px auto;
+  padding: 11px 14px 14px;
+  border: 1px solid #e4e8df;
+  border-radius: 10px;
+  background: #fff;
+  box-sizing: border-box;
+}
+.advertising-caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #8c9782;
+  font-size: 10px;
+  line-height: 1.6;
+}
+.advertising-caption > span { text-transform: uppercase; letter-spacing: 1.1px; }
+.advertising-content {
+  min-height: 100px;
+  margin-top: 8px;
+  width: 100%;
+}
+.advertising-placeholder {
+  min-height: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  background: #f8faf5;
+  border: 1px dashed #e0e6d9;
+  border-radius: 6px;
+  color: #9ba68f;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+.passo-ad-unit { display: block; width: 100%; min-height: 100px; height: 100px; }
+.advertising-preferences {
+  color: #748467;
+  font-size: 10px;
+  line-height: 1.6;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  min-height: 32px;
+}
+@media (max-width: 600px) {
+  .advertising-banner { margin-block: 20px; padding: 10px 12px 12px; }
+  .advertising-caption, .advertising-preferences { font-size: 10px; }
+  .advertising-placeholder { font-size: 11px; }
+}

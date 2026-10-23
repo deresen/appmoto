@@ -76,9 +76,16 @@ function client(base: string, existingCookie = "") {
   };
 }
 
-async function eventStream(browser: ReturnType<typeof client>) {
+interface Snapshot {
+  reports: RoadReport[];
+  focusedReport?: RoadReport | null;
+  focusStatus?: "active" | "resolved" | "expired" | "missing";
+}
+
+async function eventStream(browser: ReturnType<typeof client>, focusedId?: string) {
   const controller = new AbortController();
-  const response = await browser.request("/api/events", {
+  const path = focusedId === undefined ? "/api/events" : `/api/events?segnalazione=${encodeURIComponent(focusedId)}`;
+  const response = await browser.request(path, {
     signal: controller.signal,
   });
   assert.equal(response.status, 200);
@@ -90,30 +97,32 @@ async function eventStream(browser: ReturnType<typeof client>) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  return {
-    async next(): Promise<RoadReport[]> {
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      try {
-        while (true) {
-          const boundary = buffer.indexOf("\n\n");
-          if (boundary >= 0) {
-            const message = buffer.slice(0, boundary);
-            buffer = buffer.slice(boundary + 2);
-            const line = message
-              .split("\n")
-              .find((line) => line.startsWith("data: "));
-            if (message.includes("event: reports") && line)
-              return JSON.parse(line.slice(6)).reports;
-            continue;
-          }
-          const { done, value } = await reader.read();
-          assert.equal(done, false, "SSE stream must remain open");
-          buffer += decoder.decode(value, { stream: true });
+  async function nextSnapshot(): Promise<Snapshot> {
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+      while (true) {
+        const boundary = buffer.indexOf("\n\n");
+        if (boundary >= 0) {
+          const message = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const line = message
+            .split("\n")
+            .find((line) => line.startsWith("data: "));
+          if (message.includes("event: reports") && line)
+            return JSON.parse(line.slice(6));
+          continue;
         }
-      } finally {
-        clearTimeout(timeout);
+        const { done, value } = await reader.read();
+        assert.equal(done, false, "SSE stream must remain open");
+        buffer += decoder.decode(value, { stream: true });
       }
-    },
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return {
+    nextSnapshot,
+    async next(): Promise<RoadReport[]> { return (await nextSnapshot()).reports; },
     close() {
       controller.abort();
       void reader.cancel().catch(() => {});
@@ -276,10 +285,12 @@ test("confirmation is idempotent per browser and does not extend expiry; expired
     assert.deepEqual(expired.reports, []);
     const late = await first.post(`/api/reports/${report.id}/confirm`);
     assert.equal(late.status, 410);
-    await late.json();
+    const lateBody = await late.json();
+    assert.equal(lateBody.code, "REPORT_INACTIVE");
+    assert.equal(lateBody.reason, "expired");
     const lateClear = await first.post(`/api/reports/${report.id}/clear`, {});
     assert.equal(lateClear.status, 410);
-    await lateClear.json();
+    assert.equal((await lateClear.json()).reason, "expired");
   } finally {
     await instance.close();
   }
@@ -337,11 +348,13 @@ test("SSE sends creation, mutually exclusive votes and resolved removal with ind
   }
 });
 
-test("confirms an active report outside the capped map list without losing its response", async () => {
+test("shared report outside the map cap remains readable and receives personalized SSE votes and resolution", async () => {
   const directory = await mkdtemp(join(tmpdir(), "appmoto-volume-"));
   const dbPath = join(directory, "test.sqlite");
   const clock = Date.parse("2026-10-22T10:00:00Z");
   const instance = await start({ dbPath, now: () => clock });
+  let focused: Awaited<ReturnType<typeof eventStream>> | undefined;
+  let observer: Awaited<ReturnType<typeof eventStream>> | undefined;
   try {
     const fixtureDb = new DatabaseSync(dbPath);
     try {
@@ -366,19 +379,116 @@ test("confirms an active report outside the capped map list without losing its r
     const { reports } = await (await browser.request("/api/reports")).json();
     assert.equal(reports.length, 500);
     assert(!reports.some((report: RoadReport) => report.id === "report-500"));
+    const shared = await browser.request("/api/reports/report-500");
+    assert.equal(shared.status, 200, "a shared link must load even when the record is outside the latest 500");
+    const original = (await shared.json()).report;
+    assert.equal(original.id, "report-500");
+    assert.equal(original.confirmations, 0);
+    focused = await eventStream(browser, original.id);
+    const other = client(instance.base);
+    observer = await eventStream(other, original.id);
+    for (const stream of [focused, observer]) {
+      const initial = await stream.nextSnapshot();
+      assert.equal(initial.focusStatus, "active");
+      assert.equal(initial.focusedReport?.id, original.id);
+      assert.equal(initial.reports.length, 500);
+      assert(!initial.reports.some(item => item.id === original.id));
+    }
     const confirmation = await browser.post("/api/reports/report-500/confirm");
     assert.equal(confirmation.status, 200);
     const { report } = await confirmation.json();
     assert.equal(report.id, "report-500");
     assert.equal(report.confirmations, 1);
+    const ownView = await focused.nextSnapshot();
+    const otherView = await observer.nextSnapshot();
+    assert.equal(ownView.focusedReport?.confirmedByMe, true);
+    assert.equal(otherView.focusedReport?.confirmedByMe, false);
+    assert.equal(otherView.focusedReport?.confirmations, 1);
+    assert.equal((await (await browser.request("/api/reports/report-500")).json()).report.confirmedByMe, true);
+    assert.equal((await (await other.request("/api/reports/report-500")).json()).report.confirmedByMe, false);
     const duplicate = await browser.post("/api/reports", validReport);
     assert.equal(duplicate.status, 409, "duplicate detection must include reports outside the capped map list");
     const conflict = await duplicate.json();
     assert.equal(conflict.code, "POSSIBLE_DUPLICATE");
     assert.deepEqual(conflict.duplicates.map((item: RoadReport) => item.id), ["report-500"]);
+    for (const voter of [browser, other, client(instance.base)]) {
+      const response = await voter.post("/api/reports/report-500/clear", {});
+      assert.equal(response.status, 200);
+      const { report: updated } = await response.json();
+      const views: Snapshot[] = await Promise.all([focused.nextSnapshot(), observer.nextSnapshot()]);
+      for (const snapshot of views) {
+        assert.equal(snapshot.reports.length, 500, "focusing one record must not expand or replace the capped list");
+        assert.equal(snapshot.focusStatus, updated.resolvedAt ? "resolved" : "active");
+        if (updated.resolvedAt) assert.equal(snapshot.focusedReport, null);
+        else assert.equal(snapshot.focusedReport?.clearVotes, updated.clearVotes);
+      }
+    }
+    const inactive = await browser.request("/api/reports/report-500");
+    assert.equal(inactive.status, 410);
+    const inactiveBody = await inactive.json();
+    assert.equal(inactiveBody.code, "REPORT_INACTIVE");
+    assert.equal(inactiveBody.reason, "resolved");
+    assert.equal("report" in inactiveBody, false, "inactive links must not disclose an active-looking record");
   } finally {
+    focused?.close();
+    observer?.close();
     await instance.close();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("shared endpoints reject malformed IDs and distinguish missing and expired records without adding votes", async () => {
+  let clock = Date.parse("2026-10-23T10:00:00Z");
+  const instance = await start({ dbPath: ":memory:", now: () => clock });
+  let focused: Awaited<ReturnType<typeof eventStream>> | undefined;
+  let plain: Awaited<ReturnType<typeof eventStream>> | undefined;
+  let missing: Awaited<ReturnType<typeof eventStream>> | undefined;
+  try {
+    const browser = client(instance.base);
+    const { report } = await (await browser.post("/api/reports", validReport)).json();
+    for (let index = 0; index < 2; index++) {
+      const response = await browser.request(`/api/reports/${report.id}`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { report }, "reading a shared report must not add or renew votes");
+      assert.match(response.headers.get("Cache-Control") ?? "", /no-store/);
+    }
+    for (const suffix of ["bad%20id", "bad%2Fid", "bad%0A", "bad%0D", "%00", "%E0%A4%A", "x".repeat(129)]) {
+      const response = await browser.request(`/api/reports/${suffix}`);
+      assert.equal(response.status, 400, suffix);
+      await response.text();
+    }
+    for (const query of ["", "bad%20id", "bad%2Fid", "bad%0A", "bad%0D", "%00", "%E0%A4%A", "x".repeat(129), `${report.id}&segnalazione=${report.id}`]) {
+      const response = await browser.request(`/api/events?segnalazione=${query}`);
+      assert.equal(response.status, 400, `invalid focus must be rejected before opening SSE: ${query}`);
+      await response.text();
+    }
+    const absent = await browser.request("/api/reports/nonexistent-report");
+    assert.equal(absent.status, 404);
+    assert.equal((await absent.json()).code, "REPORT_NOT_FOUND");
+    missing = await eventStream(browser, "nonexistent-report");
+    const missingState = await missing.nextSnapshot();
+    assert.equal(missingState.focusStatus, "missing");
+    assert.equal(missingState.focusedReport, null);
+    missing.close(); missing = undefined;
+    focused = await eventStream(browser, report.id);
+    assert.equal((await focused.nextSnapshot()).focusStatus, "active");
+    plain = await eventStream(browser);
+    assert.deepEqual(Object.keys(await plain.nextSnapshot()), ["reports"], "old subscribers must retain the original snapshot shape");
+    clock += REPORT_LIFETIME_MS + 1;
+    const expired = await browser.request(`/api/reports/${report.id}`);
+    assert.equal(expired.status, 410);
+    const error = await expired.json();
+    assert.equal(error.code, "REPORT_INACTIVE");
+    assert.equal(error.reason, "expired");
+    assert.equal("report" in error, false);
+    await (await browser.post("/api/reports", validReport)).json();
+    const updated = await focused.nextSnapshot();
+    assert.equal(updated.focusStatus, "expired", "a new broadcast must not keep the focused expired hazard visible");
+    assert.equal(updated.focusedReport, null);
+    assert.equal(updated.reports.length, 1);
+  } finally {
+    focused?.close(); plain?.close(); missing?.close();
+    await instance.close();
   }
 });
 
@@ -471,15 +581,19 @@ test("clear votes are unique per browser, exclusive with confirmations and termi
       assert.deepEqual((await retry.json()).report, { ...resolved, clearedByMe: true });
       const revival = await voter.post(`${path}/confirm`);
       assert.equal(revival.status, 410, "a resolved report cannot be brought back by a confirmation");
-      await revival.json();
+      const revivalBody = await revival.json();
+      assert.equal(revivalBody.code, "REPORT_INACTIVE");
+      assert.equal(revivalBody.reason, "resolved");
     }
     const lateVote = await outsider.post(`${path}/clear`);
     assert.equal(lateVote.status, 410);
-    await lateVote.json();
+    assert.equal((await lateVote.json()).reason, "resolved");
     clock = Date.parse(original.expiresAt);
     const expiredRetry = await third.post(`${path}/clear`);
     assert.equal(expiredRetry.status, 410, "expiry takes precedence over resolution retry idempotence");
-    await expiredRetry.json();
+    const expiredRetryBody = await expiredRetry.json();
+    assert.equal(expiredRetryBody.code, "REPORT_INACTIVE");
+    assert.equal(expiredRetryBody.reason, "resolved", "the terminal resolution reason remains consistent with the shared GET endpoint");
   } finally {
     await instance.close();
   }

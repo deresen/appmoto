@@ -18,6 +18,12 @@ export type Report = {
   resolvedAt: string | null;
   source: "community" | "demo";
 };
+export type ReportFocusStatus = "active" | "resolved" | "expired" | "missing";
+export type ReportsSnapshot = {
+  reports: Report[];
+  focusedReport?: Report | null;
+  focusStatus?: ReportFocusStatus;
+};
 export type NewReport = Pick<
   Report,
   | "category"

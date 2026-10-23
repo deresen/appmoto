@@ -27,6 +27,9 @@ export const REPORT_LIFETIME_MS = DEFAULT_REPORT_LIFETIME_MS;
 const COOKIE_NAME = "passo_session";
 const CATEGORY_SQL = CATEGORY_VALUES.map(category => `'${category.replaceAll("'", "''")}'`).join(",");
 const CATEGORY_SCHEMA_KEY = "categories_schema_v2";
+function isValidReportId(value: string) {
+  return value.length > 0 && value.length <= 128 && !/[^A-Za-z0-9_-]/.test(value);
+}
 
 export interface RoadReport {
   id: string;
@@ -375,6 +378,23 @@ export function createApp(options: AppOptions = {}) {
     return row ? toReport(row) : undefined;
   }
 
+  function focusFor(id: string, participantId: string) {
+    const report = reportFor(id, participantId);
+    const focusStatus = !report ? "missing" : report.resolvedAt ? "resolved"
+      : Date.parse(report.expiresAt) <= now() ? "expired" : "active";
+    return {
+      focusedReport: focusStatus === "active" ? report! : null,
+      focusStatus,
+    };
+  }
+
+  function snapshotFor(participantId: string, focusedId?: string) {
+    return {
+      reports: reportsFor(participantId),
+      ...(focusedId ? focusFor(focusedId, participantId) : {}),
+    };
+  }
+
   function nearbyDuplicates(data: z.infer<typeof reportSchema>, participantId: string, timestamp: string): RoadReport[] {
     // This conservative latitude band is indexed and remains correct at the
     // poles and date line; Haversine performs the exact circular check.
@@ -391,14 +411,16 @@ export function createApp(options: AppOptions = {}) {
     db.exec("BEGIN IMMEDIATE");
     try {
       const existing = reportFor(id, participantId);
-      let outcome: { status: number; report?: RoadReport; error?: string };
-      if (!existing) outcome = { status: 404, error: "Segnalazione non trovata." };
+      let outcome: { status: number; report?: RoadReport; error?: string; code?: string; reason?: "resolved" | "expired" };
+      if (!existing) outcome = { status: 404, error: "Segnalazione non trovata.", code: "REPORT_NOT_FOUND" };
       else if (Date.parse(existing.expiresAt) <= now()) {
-        outcome = { status: 410, error: "Questa segnalazione è scaduta. Puoi crearne una nuova." };
+        outcome = { status: 410,
+          error: existing.resolvedAt ? "Questa segnalazione è già stata rimossa dalla mappa." : "Questa segnalazione è scaduta. Puoi crearne una nuova.",
+          code: "REPORT_INACTIVE", reason: existing.resolvedAt ? "resolved" : "expired" };
       } else if (existing.resolvedAt) {
         outcome = action === "clear" && existing.clearedByMe
           ? { status: 200, report: existing }
-          : { status: 410, error: "Questa segnalazione è già stata rimossa dalla mappa." };
+          : { status: 410, error: "Questa segnalazione è già stata rimossa dalla mappa.", code: "REPORT_INACTIVE", reason: "resolved" };
       } else {
         const timestamp = new Date(now()).toISOString();
         if (action === "confirm") {
@@ -488,10 +510,11 @@ export function createApp(options: AppOptions = {}) {
     next();
   });
 
-  const clients = new Set<{ response: Response; participantId: string }>();
-  function sendSnapshot(client: { response: Response; participantId: string }) {
+  type EventClient = { response: Response; participantId: string; focusedId?: string };
+  const clients = new Set<EventClient>();
+  function sendSnapshot(client: EventClient) {
     client.response.write(
-      `event: reports\ndata: ${JSON.stringify({ reports: reportsFor(client.participantId) })}\n\n`,
+      `event: reports\ndata: ${JSON.stringify(snapshotFor(client.participantId, client.focusedId))}\n\n`,
     );
   }
   function broadcast() {
@@ -531,6 +554,22 @@ export function createApp(options: AppOptions = {}) {
   });
   app.get("/api/reports", (_req, res) => {
     res.json({ reports: reportsFor(res.locals.participantId) });
+  });
+  app.get("/api/reports/:id", (req, res) => {
+    const id = req.params.id;
+    if (typeof id !== "string" || !isValidReportId(id)) {
+      res.status(400).json({ error: "Il link della segnalazione non è valido.", code: "INVALID_REPORT_ID" });
+      return;
+    }
+    const focus = focusFor(id, res.locals.participantId);
+    if (focus.focusStatus === "missing") {
+      res.status(404).json({ error: "Segnalazione non trovata.", code: "REPORT_NOT_FOUND" });
+    } else if (focus.focusStatus !== "active") {
+      res.status(410).json({
+        error: focus.focusStatus === "resolved" ? "Questa segnalazione è stata risolta." : "Questa segnalazione è scaduta.",
+        code: "REPORT_INACTIVE", reason: focus.focusStatus,
+      });
+    } else res.json({ report: focus.focusedReport });
   });
   app.post("/api/reports", rateLimit("create", 20), (req, res) => {
     if (!req.is("application/json")) {
@@ -575,14 +614,22 @@ export function createApp(options: AppOptions = {}) {
   function feedbackHandler(action: "confirm" | "clear") {
     return (req: Request, res: Response) => {
       const outcome = feedback(String(req.params.id), res.locals.participantId, action);
-      res.status(outcome.status).json(outcome.report ? { report: outcome.report } : { error: outcome.error });
+      res.status(outcome.status).json(outcome.report ? { report: outcome.report } : {
+        error: outcome.error, code: outcome.code, reason: outcome.reason,
+      });
       if (outcome.status === 200) broadcast();
     };
   }
   const feedbackRateLimit = rateLimit("feedback", 100);
   app.post("/api/reports/:id/confirm", feedbackRateLimit, feedbackHandler("confirm"));
   app.post("/api/reports/:id/clear", feedbackRateLimit, feedbackHandler("clear"));
-  app.get("/api/events", (_req, res) => {
+  app.get("/api/events", (req, res) => {
+    const values = new URL(req.originalUrl, "http://localhost").searchParams.getAll("segnalazione");
+    if (values.length > 1 || (values.length === 1 && !isValidReportId(values[0]))) {
+      res.status(400).json({ error: "Il link della segnalazione non è valido.", code: "INVALID_REPORT_ID" });
+      return;
+    }
+    const focusedId = values[0];
     const participantId = String(res.locals.participantId);
     if (
       clients.size >= 500 ||
@@ -602,7 +649,7 @@ export function createApp(options: AppOptions = {}) {
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
     res.write("retry: 3000\n\n");
-    const client = { response: res, participantId };
+    const client = { response: res, participantId, focusedId };
     clients.add(client);
     sendSnapshot(client);
     res.on("close", () => clients.delete(client));
@@ -638,6 +685,10 @@ export function createApp(options: AppOptions = {}) {
     });
   }
   const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
+    if (error instanceof URIError) {
+      res.status(400).json({ error: "Il link della segnalazione non è valido.", code: "INVALID_REPORT_ID" });
+      return;
+    }
     const status =
       error.type === "entity.too.large"
         ? 413

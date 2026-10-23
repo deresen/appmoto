@@ -18,6 +18,33 @@ La ricerca nelle vicinanze usa la posizione richiesta al browser su azione dell'
 
 Il filtro e le distanze sono calcolati sui dati già ricevuti, al massimo le **500 segnalazioni attive più recenti**. Non garantiscono una ricerca completa di tutte le strade nella zona. Se il permesso di posizione viene negato o il GPS non è disponibile, la mappa e i filtri normali restano utilizzabili. La geolocalizzazione richiede un browser compatibile e HTTPS, salvo localhost per lo sviluppo; non aggiunge servizi o abbonamenti a pagamento.
 
+## Condividere una segnalazione
+
+Il pulsante **Condividi** nel dettaglio di una segnalazione community apre il menu di condivisione del telefono, se disponibile. In alternativa si può copiare il link; se il browser blocca anche gli appunti, il collegamento rimane selezionabile per la copia manuale. La scelta di WhatsApp o di un destinatario spetta sempre all'utente: l'app non invia messaggi automaticamente e l'annullamento del menu non viene indicato come una condivisione riuscita. Gli esempi dimostrativi non si condividono come pericoli reali.
+
+Il collegamento ha la forma `/?segnalazione=<id>` e contiene soltanto l'identificativo pubblico della segnalazione. Non include cookie, identità del browser o coordinate GPS private. Aprendolo si vedono il dettaglio e il punto sulla mappa senza richiedere la geolocalizzazione. I collegamenti scaduti o già risolti mostrano uno stato esplicito; quelli non più disponibili non vengono presentati come pericoli attivi.
+
+L'API `GET /api/reports/:id` recupera anche un punto attivo fuori dal limite di 500 elementi della lista. Risponde `404` se non esiste e `410` per punti risolti o scaduti. Gli stream SSE/WebSocket con `?segnalazione=<id>` mantengono la lista normale e aggiungono `focusedReport` e `focusStatus` per aggiornare il punto condiviso in tempo reale anche quando è fuori lista.
+
+## Banner e Google AdSense
+
+Sono previsti due banner in pagina, contrassegnati **Pubblicità**, separati dalla mappa e dalle azioni sulle segnalazioni. La rete AdSense seleziona gli annunci per le unità display configurate. La funzione Google **Auto ads**, che decide autonomamente posizioni aggiuntive, va lasciata disattivata nel dashboard per mantenere soltanto questi due spazi.
+
+La configurazione pubblica è `public/ads-config.json`. Contiene soltanto identificatori destinati alla pagina: nessuna password o chiave privata. Il publisher già inserito permette alla build di generare il meta `google-adsense-account` e `/ads.txt` per la verifica del sito, **anche con `enabled: false`**. Questo non attiva annunci né carica script pubblicitari. L'approvazione viene decisa da Google: l'app non ne verifica automaticamente lo stato e non garantisce l'idoneità dell'attuale sottodominio `workers.dev`.
+
+Per attivare gli annunci dopo l'approvazione:
+
+1. Nel proprio account AdSense aggiungere e verificare il sito pubblicato. Il meta di verifica è nel codice HTML e `ads.txt` viene generato nella build; una verifica del sito resta distinta dall'approvazione alla pubblicazione degli annunci.
+2. Creare due unità **display** e copiare i rispettivi identificativi numerici in `slots.afterMap` e `slots.footer`.
+3. In **Privacy e messaggi** pubblicare il messaggio europeo della CMP certificata Google. Inserire in `cmpScriptUrl` l'URL del tag fornito dal dashboard, della forma `https://fundingchoicesmessages.google.com/i/pub-<publisher>?ers=1`, corrispondente allo stesso publisher.
+4. Impostare `enabled: true`, distribuire la nuova build e verificare il consenso con annunci di test o richieste intercettate, senza cliccare i propri annunci reali.
+
+Con la configurazione attuale gli annunci sono **disattivati**: si vedono soltanto gli spazi riservati e non vengono richiesti script Google. Dopo l'attivazione viene caricata prima la CMP certificata. Il codice pubblicitario parte soltanto con una risposta TCF valida e consenso esplicito a Google e alle finalità di archiviazione/personalizzazione utilizzate. Un semplice banner artigianale «Accetto» non sostituisce la CMP.
+
+Il controllo è deliberatamente restrittivo: rifiuto, risposta incompleta, CMP assente o indisponibile, e assenza di consenso TCF esplicito anche fuori dal suo ambito geografico lasciano gli spazi senza annunci. Questa prima integrazione non serve pubblicità non personalizzata o «limitata» in assenza di quel consenso. Il comando **Preferenze pubblicità** compare quando l'API della CMP consente di riaprire le scelte. Il ritiro del consenso rimuove le unità mostrate e impedisce nuovi inserimenti controllati dall'app; non può annullare richieste di rete già iniziate o disfare codice di terzi già eseguito.
+
+AdSense e la CMP sono servizi esterni da configurare nel proprio account; questa implementazione non attiva un piano hosting a pagamento. Documentazione: [Guida AdSense](https://support.google.com/adsense/?hl=it), [ads.txt](https://support.google.com/adsense/answer/7584263?hl=it), [API Privacy e messaggi Google](https://developers.google.com/funding-choices/fc-api-docs).
+
 ## Sviluppo locale
 
 Servono **Node.js 24+** e npm:

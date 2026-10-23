@@ -1,0 +1,108 @@
+.report-share {
+  border: 1px solid #dce5d4;
+  border-radius: 9px;
+  padding: 15px;
+  margin-top: 20px;
+  background: #f8faf5;
+}
+.report-share-intro {
+  color: #718267;
+  font-size: 12px;
+  line-height: 1.8;
+  margin-bottom: 11px;
+}
+.report-share-actions {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.report-share-actions button {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 7px;
+  min-height: 44px;
+  padding: 10px 11px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.6;
+}
+.report-share-primary {
+  flex: 1 1 170px;
+  background: #466c51;
+  color: #fff;
+  border: 1px solid #466c51;
+}
+.report-share-primary:hover:not(:disabled) { background: #35563e; }
+.report-share-copy {
+  flex: 1 1 100px;
+  color: #5b7750;
+  background: #fff;
+  border: 1px solid #cbdac0;
+}
+.report-share-copy:hover:not(:disabled) { background: #edf4e7; }
+.report-share-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: #5b784c;
+  font-size: 11px;
+  line-height: 1.8;
+}
+.report-share-status:not(:empty) { margin-top: 11px; }
+.report-share-status > svg { margin-top: 3px; }
+.report-share-manual {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  margin-top: 12px;
+}
+.report-share-manual label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #6f805e;
+}
+.report-share-manual input {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  min-height: 44px;
+  border: 1px solid #cbd8bf;
+  border-radius: 6px;
+  color: #526a43;
+  background: #fff;
+  font-size: 12px;
+}
+.report-share-manual button {
+  min-height: 40px;
+  color: #5a754a;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 700;
+  text-decoration: underline;
+  align-self: flex-start;
+}
+.focused-report-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 10px 16px;
+  margin-top: 18px;
+}
+.focused-report-state .text-button,
+.inactive-report-state > .text-button {
+  justify-content: center;
+  min-height: 44px;
+  margin: 10px auto;
+}
+@media (max-width: 600px) {
+  .report-share { padding: 13px; }
+  .report-share-actions button { font-size: 12px; }
+  .report-share-manual input { font-size: 16px; }
+}

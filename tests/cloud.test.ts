@@ -22,6 +22,12 @@ interface Report {
   location: string;
 }
 
+interface Snapshot {
+  reports: Report[];
+  focusedReport?: Report | null;
+  focusStatus?: "active" | "resolved" | "expired" | "missing";
+}
+
 const validReport = {
   category: "pothole", latitude: 45.4714, longitude: 10.535,
   location: "Desenzano · Via Marconi", description: "Buche dopo la rotonda.", severity: "attention",
@@ -104,32 +110,35 @@ function browser(base: string, existingCookie = "") {
   };
 }
 
-async function socketFor(base: string, cookie: string) {
-  const socket = new WebSocket(`${base.replace("http:", "ws:")}/api/events`, { headers: { Cookie: cookie, Origin: base } });
-  const queued: Report[][] = [];
-  const pending: Array<{ resolve: (reports: Report[]) => void; reject: (error: Error) => void }> = [];
+async function socketFor(base: string, cookie: string, focusedId?: string) {
+  const path = focusedId === undefined ? "/api/events" : `/api/events?segnalazione=${encodeURIComponent(focusedId)}`;
+  const socket = new WebSocket(`${base.replace("http:", "ws:")}${path}`, { headers: { Cookie: cookie, Origin: base } });
+  const queued: Snapshot[] = [];
+  const pending: Array<{ resolve: (snapshot: Snapshot) => void; reject: (error: Error) => void }> = [];
   let receivedPong: (() => void) | undefined;
   socket.on("message", data => {
     const text = data.toString();
     if (text === "pong") { receivedPong?.(); return; }
-    const message = JSON.parse(text) as { reports: Report[] };
+    const message = JSON.parse(text) as Snapshot;
     const waiter = pending.shift();
-    if (waiter) waiter.resolve(message.reports);
-    else queued.push(message.reports);
+    if (waiter) waiter.resolve(message);
+    else queued.push(message);
   });
   socket.on("error", error => { for (const waiter of pending.splice(0)) waiter.reject(error); });
   await new Promise<void>((resolve, reject) => {
     socket.once("open", resolve);
     socket.once("error", reject);
   });
+  function nextSnapshot(): Promise<Snapshot> {
+    if (queued.length) return Promise.resolve(queued.shift()!);
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Nessuno snapshot WebSocket ricevuto.")), 5000);
+      pending.push({ resolve: value => { clearTimeout(timeout); resolve(value); }, reject: error => { clearTimeout(timeout); reject(error); } });
+    });
+  }
   return {
-    next(): Promise<Report[]> {
-      if (queued.length) return Promise.resolve(queued.shift()!);
-      return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error("Nessuno snapshot WebSocket ricevuto.")), 5000);
-        pending.push({ resolve: value => { clearTimeout(timeout); resolve(value); }, reject: error => { clearTimeout(timeout); reject(error); } });
-      });
-    },
+    nextSnapshot,
+    async next(): Promise<Report[]> { return (await nextSnapshot()).reports; },
     ping(): Promise<void> {
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("Nessun pong WebSocket ricevuto.")), 5000);
@@ -246,6 +255,85 @@ test("Cloudflare: API, asset, SQLite e WebSocket reali nel runtime locale worker
       secondSocket.close(); secondSocket = undefined;
     });
 
+    await t.test("link singoli e WebSocket focalizzati mantengono stato personale e distinguono record rimossi o mancanti", async () => {
+      const own = await second.request(`/api/reports/${createdId}`);
+      assert.equal(own.status, 200);
+      const original = (await own.json()).report;
+      assert.equal(original.confirmedByMe, true);
+      assert.equal((await (await first.request(`/api/reports/${createdId}`)).json()).report.confirmedByMe, false);
+      assert.deepEqual((await (await second.request(`/api/reports/${createdId}`)).json()).report, original,
+        "reading a link must not add votes or extend the lifetime");
+      assert.match(own.headers.get("Cache-Control") ?? "", /no-store/);
+      for (const suffix of ["bad%20id", "bad%2Fid", "bad%0A", "bad%0D", "%00", "%E0%A4%A", "x".repeat(129)]) {
+        const response = await first.request(`/api/reports/${suffix}`);
+        assert.equal(response.status, 400, suffix);
+        await response.text();
+      }
+      for (const query of ["", "bad%20id", "bad%2Fid", "bad%0A", "bad%0D", "%00", "%E0%A4%A", "x".repeat(129), `${createdId}&segnalazione=${createdId}`]) {
+        const response = await first.request(`/api/events?segnalazione=${query}`);
+        assert.equal(response.status, 400, "an invalid focus must be rejected before checking the upgrade");
+        await response.text();
+      }
+      const rejectedUpgrade = await new Promise<number>((resolve, reject) => {
+        const socket = new WebSocket(`${instance!.base.replace("http:", "ws:")}/api/events?segnalazione=`, {
+          headers: { Cookie: first.cookie, Origin: instance!.base },
+        });
+        socket.once("unexpected-response", (_request, response) => {
+          response.resume(); resolve(response.statusCode ?? 0); socket.terminate();
+        });
+        socket.once("open", () => { socket.terminate(); reject(new Error("Invalid focused subscription accepted.")); });
+        socket.once("error", reject);
+      });
+      assert.equal(rejectedUpgrade, 400);
+      const absent = await first.request("/api/reports/nonexistent-report");
+      assert.equal(absent.status, 404);
+      assert.equal((await absent.json()).code, "REPORT_NOT_FOUND");
+      const missing = await socketFor(instance!.base, first.cookie, "nonexistent-report");
+      try {
+        const initial = await missing.nextSnapshot();
+        assert.equal(initial.focusStatus, "missing");
+        assert.equal(initial.focusedReport, null);
+      } finally { missing.close(); }
+
+      const creation = await first.post("/api/reports", { ...validReport, latitude: validReport.latitude + 5 });
+      assert.equal(creation.status, 201);
+      const { report } = await creation.json();
+      const streams = [await socketFor(instance!.base, first.cookie, report.id), await socketFor(instance!.base, second.cookie, report.id)];
+      try {
+        for (const stream of streams) {
+          const initial = await stream.nextSnapshot();
+          assert.equal(initial.focusedReport?.id, report.id);
+          assert.equal(initial.focusStatus, "active");
+        }
+        await (await first.post(`/api/reports/${report.id}/confirm`, {})).json();
+        const views = await Promise.all(streams.map(stream => stream.nextSnapshot()));
+        assert.equal(views[0].focusedReport?.confirmedByMe, true);
+        assert.equal(views[1].focusedReport?.confirmedByMe, false);
+        assert.equal(views[1].focusedReport?.confirmations, 1);
+        for (const voter of [first, second, browser(instance!.base)]) {
+          const response = await voter.post(`/api/reports/${report.id}/clear`, {});
+          assert.equal(response.status, 200);
+          const { report: updated } = await response.json();
+          for (const view of await Promise.all(streams.map(stream => stream.nextSnapshot()))) {
+            assert.equal(view.focusStatus, updated.resolvedAt ? "resolved" : "active");
+            if (updated.resolvedAt) {
+              assert.equal(view.focusedReport, null);
+              assert(!view.reports.some(item => item.id === report.id));
+            } else assert.equal(view.focusedReport?.clearVotes, updated.clearVotes);
+          }
+        }
+      } finally { for (const stream of streams) stream.close(); }
+      const removed = await first.request(`/api/reports/${report.id}`);
+      assert.equal(removed.status, 410);
+      const removedBody = await removed.json();
+      assert.equal(removedBody.code, "REPORT_INACTIVE");
+      assert.equal(removedBody.reason, "resolved");
+      assert.equal("report" in removedBody, false);
+      const plain = await socketFor(instance!.base, first.cookie);
+      try { assert.deepEqual(Object.keys(await plain.nextSnapshot()), ["reports"]); }
+      finally { plain.close(); }
+    });
+
     await t.test("rifiuta cookie manomessi e mantiene SQLite e firma dopo un riavvio", async () => {
       const tampered = savedCookie.slice(0, -1) + (savedCookie.endsWith("a") ? "b" : "a");
       const invalidBrowser = browser(instance!.base, tampered);
@@ -333,11 +421,13 @@ test("Cloudflare: API, asset, SQLite e WebSocket reali nel runtime locale worker
         assert.equal((await repeat.json()).report.resolvedAt, resolved.resolvedAt);
         const revival = await voter.post(`${path}/confirm`, {});
         assert.equal(revival.status, 410);
-        await revival.json();
+        const revivalBody = await revival.json();
+        assert.equal(revivalBody.code, "REPORT_INACTIVE");
+        assert.equal(revivalBody.reason, "resolved");
       }
       const newVote = await browser(instance!.base).post(`${path}/clear`, {});
       assert.equal(newVote.status, 410);
-      await newVote.json();
+      assert.equal((await newVote.json()).reason, "resolved");
       const replacement = await voters[0].post("/api/reports", { ...validReport, latitude: validReport.latitude + 0.02 });
       assert.equal(replacement.status, 201, "resolved reports cannot block a new hazard");
       await replacement.json();
@@ -568,6 +658,26 @@ test("Cloudflare migrates CHECK-constrained legacy SQLite with existing votes, r
     assert.equal(legacyReport.clearVotes, 1, "preexisting resolution votes must survive table reconstruction");
     assert.equal(legacyReport.clearedByMe, false);
     assert.equal(legacyReport.resolvedAt, null);
+    const shared = await restored.request("/api/reports/legacy-active");
+    assert.equal(shared.status, 200);
+    assert.deepEqual((await shared.json()).report, legacyReport, "shared links must load a record outside the map cap");
+    const expiredLink = await restored.request("/api/reports/legacy-expired");
+    assert.equal(expiredLink.status, 410);
+    assert.equal((await expiredLink.json()).reason, "expired");
+    const expiredFocus = await socketFor(instance.base, cookie, "legacy-expired");
+    try {
+      const snapshot = await expiredFocus.nextSnapshot();
+      assert.equal(snapshot.focusStatus, "expired");
+      assert.equal(snapshot.focusedReport, null);
+      assert.equal(snapshot.reports.length, 500);
+    } finally { expiredFocus.close(); }
+    const focused = await socketFor(instance.base, cookie, "legacy-active");
+    const initialFocused = await focused.nextSnapshot();
+    assert.equal(initialFocused.focusStatus, "active");
+    assert.equal(initialFocused.focusedReport?.id, "legacy-active");
+    assert.equal(initialFocused.focusedReport?.confirmedByMe, true);
+    assert.equal(initialFocused.reports.length, 500);
+    assert(!initialFocused.reports.some(item => item.id === "legacy-active"));
     const clear = await restored.post("/api/reports/legacy-active/clear", {});
     assert.equal(clear.status, 200);
     const { report: cleared } = await clear.json();
@@ -575,6 +685,13 @@ test("Cloudflare migrates CHECK-constrained legacy SQLite with existing votes, r
     assert.equal(cleared.confirmations, 0);
     assert.equal(cleared.clearedByMe, true);
     assert.equal(cleared.expiresAt, legacyReport.expiresAt);
+    try {
+      const updatedFocus = await focused.nextSnapshot();
+      assert.equal(updatedFocus.focusStatus, "active");
+      assert.equal(updatedFocus.focusedReport?.clearVotes, 2);
+      assert.equal(updatedFocus.focusedReport?.clearedByMe, true);
+      assert.equal(updatedFocus.reports.length, 500);
+    } finally { focused.close(); }
     const oldResolved = await restored.post("/api/reports/legacy-resolved/clear", {});
     assert.equal(oldResolved.status, 200);
     const oldResolvedReport = (await oldResolved.json()).report;
@@ -586,7 +703,9 @@ test("Cloudflare migrates CHECK-constrained legacy SQLite with existing votes, r
     for (const action of ["clear", "confirm"]) {
       const expired = await restored.post(`/api/reports/legacy-expired/${action}`, {});
       assert.equal(expired.status, 410);
-      await expired.json();
+      const expiredBody = await expired.json();
+      assert.equal(expiredBody.code, "REPORT_INACTIVE");
+      assert.equal(expiredBody.reason, "expired");
     }
     const replacement = await restored.post("/api/reports", { ...validReport, latitude: validReport.latitude + 3 });
     assert.equal(replacement.status, 201, "expired persisted reports must not block creation");
@@ -601,11 +720,19 @@ test("Cloudflare migrates CHECK-constrained legacy SQLite with existing votes, r
     const limitedAfterRestart = await browser(instance.base, limitedCookie).post("/api/reports", validReport);
     assert.equal(limitedAfterRestart.status, 429, "persisted limits must survive a second startup");
     await limitedAfterRestart.json();
-    for (const voter of [browser(instance.base)]) {
-      const response = await voter.post("/api/reports/legacy-active/clear", {});
-      assert.equal(response.status, 200);
-      await response.json();
-    }
+    const focusBeforeResolution = await socketFor(instance.base, cookie, "legacy-active");
+    try {
+      assert.equal((await focusBeforeResolution.nextSnapshot()).focusStatus, "active");
+      for (const voter of [browser(instance.base)]) {
+        const response = await voter.post("/api/reports/legacy-active/clear", {});
+        assert.equal(response.status, 200);
+        await response.json();
+      }
+      const removedFocus = await focusBeforeResolution.nextSnapshot();
+      assert.equal(removedFocus.focusStatus, "resolved");
+      assert.equal(removedFocus.focusedReport, null);
+      assert.equal(removedFocus.reports.length, 500);
+    } finally { focusBeforeResolution.close(); }
     await instance.stop();
     instance = await startWorker(directory, port);
     restored = browser(instance.base, cookie);

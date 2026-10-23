@@ -18,6 +18,9 @@ const RETENTION_MS = DEFAULT_REPORT_LIFETIME_MS;
 const COOKIE_NAME = "passo_session";
 const CATEGORY_SQL = CATEGORY_VALUES.map(category => `'${category.replaceAll("'", "''")}'`).join(",");
 const CATEGORY_SCHEMA_KEY = "categories_schema_v2";
+function isValidReportId(value: string) {
+  return value.length > 0 && value.length <= 128 && !/[^A-Za-z0-9_-]/.test(value);
+}
 const encoder = new TextEncoder();
 const reportSchema = z.object({
   category: z.enum(CATEGORY_VALUES),
@@ -49,7 +52,8 @@ type ReportRow = {
 };
 
 class HttpError extends Error {
-  constructor(readonly status: number, message: string) { super(message); }
+  constructor(readonly status: number, message: string,
+    readonly details: { code?: string; reason?: "resolved" | "expired" } = {}) { super(message); }
 }
 
 function hex(bytes: ArrayBuffer | Uint8Array): string {
@@ -251,6 +255,23 @@ export class RoadReports extends DurableObject<Env> {
     return row ? toReport(row) : undefined;
   }
 
+  private focus(id: string, participantId: string) {
+    const report = this.report(id, participantId);
+    const focusStatus = !report ? "missing" : report.resolvedAt ? "resolved"
+      : Date.parse(report.expiresAt) <= Date.now() ? "expired" : "active";
+    return {
+      focusedReport: focusStatus === "active" ? report! : null,
+      focusStatus,
+    };
+  }
+
+  private snapshot(participantId: string, focusedId?: string) {
+    return {
+      reports: this.reports(participantId),
+      ...(focusedId ? this.focus(focusedId, participantId) : {}),
+    };
+  }
+
   private nearbyDuplicates(data: z.infer<typeof reportSchema>, participantId: string, timestamp: string) {
     // Indexed latitude candidates avoid a full table scan. Exact Haversine
     // distance also handles reports near the poles and across the date line.
@@ -267,10 +288,10 @@ export class RoadReports extends DurableObject<Env> {
 
   private broadcast() {
     for (const socket of this.ctx.getWebSockets()) {
-      const attachment = socket.deserializeAttachment() as { participantId?: string } | null;
+      const attachment = socket.deserializeAttachment() as { participantId?: string; focusedId?: string } | null;
       if (!attachment?.participantId) { socket.close(1008, "Sessione non valida."); continue; }
       if (socket.readyState !== WebSocket.OPEN) continue;
-      try { socket.send(JSON.stringify({ reports: this.reports(attachment.participantId) })); }
+      try { socket.send(JSON.stringify(this.snapshot(attachment.participantId, attachment.focusedId))); }
       catch { try { socket.close(1011, "Connessione interrotta."); } catch { /* Already disconnected. */ } }
     }
   }
@@ -333,7 +354,30 @@ export class RoadReports extends DurableObject<Env> {
       if (request.method === "GET" && url.pathname === "/api/reports") {
         return json({ reports: this.reports(participantId) }, 200, setCookie);
       }
+      const reportMatch = /^\/api\/reports\/([^/]+)$/.exec(url.pathname);
+      if (request.method === "GET" && reportMatch) {
+        let id: string;
+        try { id = decodeURIComponent(reportMatch[1]); }
+        catch { return json({ error: "Il link della segnalazione non è valido.", code: "INVALID_REPORT_ID" }, 400, setCookie); }
+        if (!isValidReportId(id)) {
+          return json({ error: "Il link della segnalazione non è valido.", code: "INVALID_REPORT_ID" }, 400, setCookie);
+        }
+        const focus = this.focus(id, participantId);
+        if (focus.focusStatus === "missing") {
+          return json({ error: "Segnalazione non trovata.", code: "REPORT_NOT_FOUND" }, 404, setCookie);
+        }
+        if (focus.focusStatus !== "active") {
+          return json({ error: focus.focusStatus === "resolved" ? "Questa segnalazione è stata risolta." : "Questa segnalazione è scaduta.",
+            code: "REPORT_INACTIVE", reason: focus.focusStatus }, 410, setCookie);
+        }
+        return json({ report: focus.focusedReport }, 200, setCookie);
+      }
       if (request.method === "GET" && url.pathname === "/api/events") {
+        const values = url.searchParams.getAll("segnalazione");
+        if (values.length > 1 || (values.length === 1 && !isValidReportId(values[0]))) {
+          return json({ error: "Il link della segnalazione non è valido.", code: "INVALID_REPORT_ID" }, 400, setCookie);
+        }
+        const focusedId = values[0];
         if (!wantsSocket) throw new HttpError(426, "Apri una connessione WebSocket per gli aggiornamenti.");
         if (this.ctx.getWebSockets().length >= 500 || this.ctx.getWebSockets(participantId).length >= 5) {
           throw new HttpError(429, "Troppe connessioni aperte. Chiudi una scheda e riprova.");
@@ -341,8 +385,8 @@ export class RoadReports extends DurableObject<Env> {
         const pair = new WebSocketPair();
         const [client, server] = Object.values(pair);
         this.ctx.acceptWebSocket(server, [participantId]);
-        server.serializeAttachment({ participantId });
-        server.send(JSON.stringify({ reports: this.reports(participantId) }));
+        server.serializeAttachment({ participantId, focusedId });
+        server.send(JSON.stringify(this.snapshot(participantId, focusedId)));
         const headers = new Headers();
         if (setCookie) headers.set("Set-Cookie", setCookie);
         return new Response(null, { status: 101, webSocket: client, headers });
@@ -376,11 +420,13 @@ export class RoadReports extends DurableObject<Env> {
         await this.rateLimit(request, participantId, "feedback", 100);
         const report = this.ctx.storage.transactionSync(() => {
           const existing = this.report(feedbackMatch[1], participantId);
-          if (!existing) throw new HttpError(404, "Segnalazione non trovata.");
-          if (Date.parse(existing.expiresAt) <= Date.now()) throw new HttpError(410, "Questa segnalazione è scaduta. Puoi crearne una nuova.");
+          if (!existing) throw new HttpError(404, "Segnalazione non trovata.", { code: "REPORT_NOT_FOUND" });
+          if (Date.parse(existing.expiresAt) <= Date.now()) throw new HttpError(410,
+            existing.resolvedAt ? "Questa segnalazione è già stata rimossa dalla mappa." : "Questa segnalazione è scaduta. Puoi crearne una nuova.",
+            { code: "REPORT_INACTIVE", reason: existing.resolvedAt ? "resolved" : "expired" });
           if (existing.resolvedAt) {
             if (feedbackMatch[2] === "clear" && existing.clearedByMe) return existing;
-            throw new HttpError(410, "Questa segnalazione è già stata rimossa dalla mappa.");
+            throw new HttpError(410, "Questa segnalazione è già stata rimossa dalla mappa.", { code: "REPORT_INACTIVE", reason: "resolved" });
           }
           const timestamp = new Date().toISOString();
           if (feedbackMatch[2] === "confirm") {
@@ -402,7 +448,7 @@ export class RoadReports extends DurableObject<Env> {
       }
       throw new HttpError(404, "Endpoint non trovato.");
     } catch (error) {
-      if (error instanceof HttpError) return json({ error: error.message }, error.status, setCookie);
+      if (error instanceof HttpError) return json({ error: error.message, ...error.details }, error.status, setCookie);
       console.error("Errore API Cloud:", error instanceof Error ? error.name : "errore sconosciuto");
       return json({ error: "Errore del server. Riprova tra poco." }, 500, setCookie);
     }

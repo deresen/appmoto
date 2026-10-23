@@ -40,7 +40,10 @@ import {
   X,
 } from "lucide-react";
 import MapView from "./MapView";
-import type { Category, NewReport, Report, Severity } from "./types";
+import AdBanner, { AdvertisingPreferencesButton } from "./AdBanner";
+import ReportShare from "./ReportShare";
+import { readReportLink } from "./reportSharing";
+import type { Category, NewReport, Report, ReportFocusStatus, ReportsSnapshot, Severity } from "./types";
 import {
   CLEAR_VOTE_THRESHOLD,
   CATEGORY_VALUES,
@@ -166,6 +169,7 @@ class ApiError extends Error {
     readonly status: number,
     readonly code?: string,
     readonly duplicates?: Report[],
+    readonly reason?: string,
   ) {
     super(message);
     this.name = "ApiError";
@@ -201,6 +205,7 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
       response.status,
       typeof data.code === "string" ? data.code : undefined,
       Array.isArray(data.duplicates) ? data.duplicates : undefined,
+      typeof data.reason === "string" ? data.reason : undefined,
     );
   return data as T;
 }
@@ -305,6 +310,17 @@ function CategoryIcon({
 }
 
 export default function App() {
+  const [reportLink, setReportLink] = useState(() => readReportLink(window.location.search));
+  const focusedId = reportLink.id;
+  const focusedIdRef = useRef(focusedId);
+  focusedIdRef.current = focusedId;
+  const focusedPositioned = useRef<string | null>(null);
+  const focusedRevision = useRef(0);
+  const [focusedReport, setFocusedReport] = useState<Report | null>(null);
+  const [focusStatus, setFocusStatus] = useState<ReportFocusStatus | "loading" | "error" | "invalid" | null>(
+    reportLink.invalid ? "invalid" : focusedId ? "loading" : null,
+  );
+  const [focusError, setFocusError] = useState("");
   const [reports, setReports] = useState<Report[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -324,7 +340,7 @@ export default function App() {
   const nearbyCurrent = useRef({ area: nearby, radius: nearbyRadius });
   nearbyCurrent.current = { area: nearby, radius: nearbyRadius };
   const [bounds, setBounds] = useState<Bounds | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(focusedId);
   const [lastSelected, setLastSelected] = useState<Report | null>(null);
   const [target, setTarget] = useState<
     (Position & { zoom?: number; radiusMeters?: number; key: number }) | null
@@ -332,7 +348,7 @@ export default function App() {
   const [mobileView, setMobileView] = useState<"map" | "list">("map");
   const [dialog, setDialog] = useState<
     "new" | "detail" | "about" | "privacy" | null
-  >(null);
+  >(focusedId || reportLink.invalid ? "detail" : null);
   const [draft, setDraft] = useState<Draft>({ ...EMPTY_DRAFT });
   const positionBeforePicking = useRef<Position | null>(null);
   const [picking, setPicking] = useState(false);
@@ -346,6 +362,7 @@ export default function App() {
   // Resolution is terminal and report UUIDs are never reused. Only an explicit
   // resolvedAt creates a tombstone; absence from the capped list does not.
   const knownResolvedIds = useRef(new Set<string>());
+  const terminalFocus = useRef(new globalThis.Map<string, "resolved" | "expired">());
   const submitInFlight = useRef(false);
   const voteInFlight = useRef(false);
   const duplicateRequestKey = useRef<string | null>(null);
@@ -354,6 +371,38 @@ export default function App() {
   const [, setTick] = useState(0);
 
   useEffect(() => () => { nearbyRequest.current += 1; }, []);
+
+  useEffect(() => {
+    function handleHistory() {
+      const next = readReportLink(window.location.search);
+      setReportLink(next);
+      if (!next.id && !next.invalid) setDialog((previous) => previous === "detail" ? null : previous);
+    }
+    window.addEventListener("popstate", handleHistory);
+    return () => window.removeEventListener("popstate", handleHistory);
+  }, []);
+
+  useEffect(() => {
+    focusedPositioned.current = null;
+    focusedRevision.current += 1;
+    setFocusedReport(null);
+    setFocusError("");
+    if (!focusedId && !reportLink.invalid) {
+      setFocusStatus(null);
+      return;
+    }
+    setFocusStatus(reportLink.invalid ? "invalid" : "loading");
+    setSelectedId(focusedId);
+    setLastSelected(null);
+    setConfirmError("");
+    setCategory("all");
+    setQuery("");
+    setShowDemo(true);
+    setMobileView("map");
+    setPicking(false);
+    disableNearby();
+    setDialog("detail");
+  }, [focusedId, reportLink.invalid]);
 
   const draftKey = JSON.stringify(draft);
   const latestDraftKey = useRef(draftKey);
@@ -364,17 +413,55 @@ export default function App() {
     setDuplicateUnavailable([]);
   }, [draftKey]);
 
-  function receiveReports(next: Report[]) {
+  function receiveReports(next: Report[], focus?: ReportsSnapshot) {
     reportsRevision.current += 1;
     for (const report of next) {
       if (report.resolvedAt) knownResolvedIds.current.add(report.id);
     }
-    const active = next.filter((report) => isActive(report) && !knownResolvedIds.current.has(report.id));
+    const active = next.filter((report) => isActive(report) && !knownResolvedIds.current.has(report.id) && !terminalFocus.current.has(report.id));
     setReports(active);
     setLastSelected((previous) => next.find((report) => report.id === previous?.id && report.resolvedAt) ?? previous);
     setDuplicateCandidates((previous) => previous
       ?.filter((candidate) => !knownResolvedIds.current.has(candidate.id))
       .map((candidate) => next.find((report) => report.id === candidate.id) ?? candidate) ?? null);
+    const id = focusedIdRef.current;
+    if (id && focus?.focusStatus) receiveFocusedReport(id, focus.focusedReport ?? null, focus.focusStatus);
+  }
+
+  function receiveFocusedReport(id: string, report: Report | null, status: ReportFocusStatus) {
+    if (id !== focusedIdRef.current) return;
+    focusedRevision.current += 1;
+    const terminal = terminalFocus.current.get(id);
+    if (terminal === "resolved" || status === "resolved") status = "resolved";
+    else if (terminal === "expired" || status === "expired") status = "expired";
+    if (status === "active" && report?.id === id && isActive(report) && !knownResolvedIds.current.has(id)) {
+      setFocusedReport(report);
+      setLastSelected(report);
+      setFocusStatus("active");
+      setFocusError("");
+      if (focusedPositioned.current !== id) {
+        focusedPositioned.current = id;
+        setTarget({ latitude: report.latitude, longitude: report.longitude, zoom: 14, key: Date.now() });
+      }
+      return;
+    }
+    if (status === "active" && !knownResolvedIds.current.has(id)) {
+      if (report?.id === id && Date.parse(report.expiresAt) <= Date.now()) status = "expired";
+      else {
+        setFocusStatus("error");
+        setFocusError("Non riusciamo ad aprire questa segnalazione. Riprova.");
+        return;
+      }
+    }
+    if (status === "resolved" || knownResolvedIds.current.has(id)) {
+      knownResolvedIds.current.add(id);
+      status = "resolved";
+    }
+    if (status === "resolved" || status === "expired") terminalFocus.current.set(id, status);
+    setFocusedReport(null);
+    setFocusStatus(status);
+    setFocusError("");
+    setReports((previous) => previous.filter((item) => item.id !== id));
   }
 
   useEffect(() => {
@@ -387,12 +474,16 @@ export default function App() {
     setLoading(true);
     setLoadError("");
     setConnection("connecting");
+    if (focusedId) {
+      setFocusStatus("loading");
+      setFocusError("");
+    }
     function receiveSnapshot(value: string) {
       if (!active || value === "pong") return;
       try {
-        const data = JSON.parse(value) as { reports?: Report[] };
+        const data = JSON.parse(value) as ReportsSnapshot;
         if (Array.isArray(data.reports)) {
-          receiveReports(data.reports);
+          receiveReports(data.reports, data);
           setConnection("live");
         }
       } catch {
@@ -402,6 +493,7 @@ export default function App() {
     function connectWebSocket() {
       if (!active) return;
       const url = new URL("/api/events", window.location.href);
+      if (focusedId) url.searchParams.set("segnalazione", focusedId);
       url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const current = new WebSocket(url);
       socket = current;
@@ -438,6 +530,25 @@ export default function App() {
         if (!active) return;
         if (requestRevision === reportsRevision.current) receiveReports(initial.reports);
         setLoading(false);
+        if (focusedId) {
+          const focusRevision = focusedRevision.current;
+          try {
+            const { report } = await api<{ report: Report }>(`/api/reports/${encodeURIComponent(focusedId)}`);
+            if (!active) return;
+            if (focusRevision === focusedRevision.current) {
+              receiveFocusedReport(focusedId, report, "active");
+            }
+          } catch (error) {
+            if (!active) return;
+            if (error instanceof ApiError && error.status === 404) receiveFocusedReport(focusedId, null, "missing");
+            else if (error instanceof ApiError && error.status === 410) {
+              receiveFocusedReport(focusedId, null, error.reason === "resolved" ? "resolved" : "expired");
+            } else {
+              setFocusStatus("error");
+              setFocusError(error instanceof Error ? error.message : "Non riusciamo ad aprire questa segnalazione. Riprova.");
+            }
+          }
+        }
         const health = await api<{ realtime: "sse" | "websocket" }>(
           "/api/health",
         );
@@ -446,7 +557,9 @@ export default function App() {
           connectWebSocket();
           return;
         }
-        events = new EventSource("/api/events", { withCredentials: true });
+        const eventUrl = new URL("/api/events", window.location.href);
+        if (focusedId) eventUrl.searchParams.set("segnalazione", focusedId);
+        events = new EventSource(eventUrl, { withCredentials: true });
         events.onopen = () => {
           if (active) setConnection("live");
         };
@@ -460,6 +573,10 @@ export default function App() {
         if (active) {
           setLoading(false);
           setConnection("offline");
+          if (focusedId) {
+            setFocusStatus("error");
+            setFocusError(error instanceof Error ? error.message : "Connessione non disponibile. Riprova.");
+          }
           setLoadError(
             error instanceof Error
               ? error.message
@@ -476,7 +593,7 @@ export default function App() {
       window.clearInterval(heartbeat);
       socket?.close();
     };
-  }, [reload]);
+  }, [reload, focusedId]);
 
   useEffect(() => {
     const id = window.setInterval(() => setTick((value) => value + 1), 30000);
@@ -488,7 +605,9 @@ export default function App() {
     return () => clearTimeout(id);
   }, [toast]);
 
-  const activeReports = reports.filter((report) => isActive(report) && !knownResolvedIds.current.has(report.id));
+  const reportById = new globalThis.Map(reports.map((report) => [report.id, report] as const));
+  if (focusedReport?.id === focusedId && focusStatus === "active") reportById.set(focusedReport.id, focusedReport);
+  const activeReports = [...reportById.values()].filter((report) => isActive(report) && !knownResolvedIds.current.has(report.id) && !terminalFocus.current.has(report.id));
   const hasExamples = reports.some((report) => report.source === "demo");
   const baseReports = activeReports.filter(
     (report) => showDemo || report.source !== "demo",
@@ -527,6 +646,11 @@ export default function App() {
     );
   const selected = activeReports.find((report) => report.id === selectedId);
   const selectedHistory = selected ?? (lastSelected?.id === selectedId ? lastSelected : null);
+  const focusedDetail = dialog === "detail" && (reportLink.invalid || Boolean(focusedId && selectedId === focusedId));
+  const focusLoading = focusedDetail && focusStatus === "loading";
+  const focusFailed = focusedDetail && (focusStatus === "error" || focusStatus === "invalid");
+  const inactiveResolved = Boolean(selectedHistory?.resolvedAt || (focusedDetail && focusStatus === "resolved"));
+  const inactiveExpired = Boolean((selectedHistory && Date.parse(selectedHistory.expiresAt) <= Date.now()) || (focusedDetail && focusStatus === "expired"));
   useEffect(() => {
     if (selected) setLastSelected(selected);
   }, [selected]);
@@ -535,6 +659,7 @@ export default function App() {
   ).length;
 
   function focusReport(report: Report, open = true) {
+    if (focusedId && report.id !== focusedId) clearReportLink();
     setSelectedId(report.id);
     setLastSelected(report);
     setTarget({
@@ -549,8 +674,28 @@ export default function App() {
     }
   }
   function openNew() {
+    clearReportLink();
     setPicking(false);
     setDialog("new");
+  }
+  function clearReportLink() {
+    const url = new URL(window.location.href);
+    if (url.searchParams.has("segnalazione")) {
+      url.searchParams.delete("segnalazione");
+      window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+    setReportLink({ id: null, invalid: false });
+    setFocusedReport(null);
+    setFocusStatus(null);
+    setFocusError("");
+  }
+  function closeDetail() {
+    clearReportLink();
+    setDialog(null);
+  }
+  function openInfo(kind: "about" | "privacy") {
+    clearReportLink();
+    setDialog(kind);
   }
   function disableNearby() {
     nearbyRequest.current += 1;
@@ -638,6 +783,7 @@ export default function App() {
     );
   }
   function applyMutation(report: Report, requestRevision: number, allowAdd = false) {
+    if (!report.resolvedAt && terminalFocus.current.has(report.id)) return;
     if (report.resolvedAt) {
       knownResolvedIds.current.add(report.id);
       setDuplicateCandidates((previous) => previous?.filter((candidate) => !knownResolvedIds.current.has(candidate.id)) ?? null);
@@ -646,10 +792,18 @@ export default function App() {
       return;
     }
     if (!isActive(report)) {
+      if (report.id === focusedIdRef.current) {
+        receiveFocusedReport(report.id, null, report.resolvedAt ? "resolved" : "expired");
+      }
       reportsRevision.current += 1;
       setReports((previous) => previous.filter((item) => item.id !== report.id));
       setLastSelected((previous) => previous?.id === report.id ? report : previous);
     } else if (reportsRevision.current === requestRevision) {
+      if (report.id === focusedIdRef.current) {
+        focusedRevision.current += 1;
+        setFocusedReport(report);
+        setFocusStatus("active");
+      }
       // A later realtime snapshot is authoritative: an older response must not
       // restore a report that the community has already removed.
       reportsRevision.current += 1;
@@ -698,6 +852,7 @@ export default function App() {
       };
       const { report } = await api<{ report: Report }>("/api/reports", body);
       applyMutation(report, requestRevision, true);
+      clearReportLink();
       const outsideNearby = prepareReportFocus(report);
       setCategory("all");
       setQuery("");
@@ -752,6 +907,7 @@ export default function App() {
         ?.filter((candidate) => !knownResolvedIds.current.has(candidate.id))
         .map((candidate) => candidate.id === updated.id ? updated : candidate) ?? null);
       if (fromDuplicate) {
+        clearReportLink();
         const outsideNearby = prepareReportFocus(updated);
         setDialog(null);
         setDraft({ ...EMPTY_DRAFT });
@@ -777,6 +933,9 @@ export default function App() {
         reportsRevision.current += 1;
         setReports((previous) => previous.filter((item) => item.id !== report.id));
         setDuplicateUnavailable((previous) => [...new Set([...previous, report.id])]);
+        if (focusedIdRef.current === report.id) {
+          receiveFocusedReport(report.id, null, error.reason === "resolved" ? "resolved" : error.reason === "expired" ? "expired" : "missing");
+        }
       }
       if (fromDuplicate) setFormError(message);
       else setConfirmError(message);
@@ -809,7 +968,7 @@ export default function App() {
           >
             Esplora la mappa
           </button>
-          <button onClick={() => setDialog("about")}>
+          <button onClick={() => openInfo("about")}>
             Come funziona <ArrowUpRight size={14} />
           </button>
         </nav>
@@ -1044,12 +1203,8 @@ export default function App() {
                 reports={filtered}
                 selectedId={selectedId}
                 onSelect={(id) => {
-                  const report = reports.find((item) => item.id === id);
-                  if (report && !picking) {
-                    setSelectedId(id);
-                    setDialog("detail");
-                    setConfirmError("");
-                  }
+                  const report = activeReports.find((item) => item.id === id);
+                  if (report && !picking) focusReport(report);
                 }}
                 target={target}
                 picking={picking}
@@ -1261,6 +1416,8 @@ export default function App() {
           </div>
         </section>
 
+        <AdBanner placement="afterMap" />
+
         <section className="how-strip" aria-label="Come contribuire">
           <div className="how-heading">
             <span className="eyebrow">POCHI SECONDI. UN AIUTO CONCRETO.</span>
@@ -1269,7 +1426,7 @@ export default function App() {
               <br />
               <span>Aggiungi la tua.</span>
             </h2>
-            <button onClick={() => setDialog("about")}>
+            <button onClick={() => openInfo("about")}>
               Scopri come funziona <ArrowUpRight size={16} />
             </button>
           </div>
@@ -1298,6 +1455,7 @@ export default function App() {
             </p>
           </div>
         </section>
+        <AdBanner placement="footer" />
       </main>
 
       <footer className="site-footer">
@@ -1307,9 +1465,10 @@ export default function App() {
           <span>La strada è di tutti. Prendiamocene cura.</span>
         </div>
         <div>
-          <button onClick={() => setDialog("privacy")}>
+          <button onClick={() => openInfo("privacy")}>
             Privacy e posizione
           </button>
+          <AdvertisingPreferencesButton />
           <span className="footer-beta">PRIMA VERSIONE</span>
         </div>
       </footer>
@@ -1551,8 +1710,21 @@ export default function App() {
       )}
 
       {dialog === "detail" && (
-        <Dialog title={selected && isActive(selected) ? CATEGORIES[selected.category].singular : "Segnalazione non più attiva"} onClose={() => setDialog(null)} className="detail-dialog">
-          {selected && isActive(selected) ? <>
+        <Dialog title={focusLoading ? "Segnalazione condivisa" : focusFailed ? "Segnalazione non disponibile" : selected && isActive(selected) ? CATEGORIES[selected.category].singular : "Segnalazione non più attiva"} onClose={closeDetail} className="detail-dialog">
+          {focusLoading ? <div className="dialog-content empty-state focused-report-state" role="status">
+            <LoaderCircle className="spin" size={30} />
+            <h3>Caricamento della segnalazione…</h3>
+            <p>Stiamo aprendo il punto condiviso sulla mappa.</p>
+            <button className="text-button" onClick={closeDetail}>Esplora la mappa</button>
+          </div> : focusFailed ? <div className="dialog-content empty-state focused-report-state" role="alert">
+            <CircleHelp size={32} />
+            <h3>{focusStatus === "invalid" ? "Questo link non è valido." : "Non riusciamo ad aprire la segnalazione."}</h3>
+            <p>{focusStatus === "invalid" ? "Controlla di avere copiato il link completo oppure esplora le segnalazioni sulla mappa." : focusError || "Controlla la connessione e riprova."}</p>
+            <div className="focused-report-actions">
+              {focusStatus === "error" && <button className="primary-button" onClick={() => setReload((previous) => previous + 1)}>Riprova</button>}
+              <button className="text-button" onClick={closeDetail}>Esplora la mappa</button>
+            </div>
+          </div> : selected && isActive(selected) ? <>
             <div className="dialog-content">
               <div className="detail-category">
                 <CategoryIcon category={selected.category} size={27} />
@@ -1567,6 +1739,7 @@ export default function App() {
                 <div><ShieldCheck size={17} /><span>Presenza segnalata dalla community<strong>{selected.confirmations} {selected.confirmations === 1 ? "conferma" : "conferme"}{selected.confirmedByMe ? ", inclusa la tua" : ""}</strong></span></div>
                 <div><Radio size={17} /><span>Visibile fino alle<strong>{new Date(selected.expiresAt).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })} del {new Date(selected.expiresAt).toLocaleDateString("it-IT", { day: "numeric", month: "long" })}</strong></span></div>
               </div>
+              <ReportShare key={selected.id} report={selected} categoryLabel={CATEGORIES[selected.category].singular} />
               <div className="confirm-explainer">
                 <h4>Che cosa hai trovato passando di qui?</h4>
                 <p>Indica solo ciò che hai osservato. Puoi cambiare voto: la nuova osservazione sostituisce quella precedente.</p>
@@ -1592,10 +1765,11 @@ export default function App() {
               </div>
             </div>
           </> : <div className="dialog-content empty-state inactive-report-state" role="status">
-            {selectedHistory?.resolvedAt ? <CheckCheck size={32} /> : <CircleHelp size={32} />}
-            <h3>{selectedHistory?.resolvedAt ? "La community ha indicato che non è più presente." : selectedHistory && new Date(selectedHistory.expiresAt).getTime() <= Date.now() ? "Questa segnalazione è scaduta." : "Questa segnalazione non è più attiva."}</h3>
-            <p>{selectedHistory?.resolvedAt ? `Sono stati raggiunti ${CLEAR_VOTE_THRESHOLD} voti di rimozione: il punto è stato tolto dalla mappa.` : `Potrebbe essere stata risolta dalla community o essere scaduta. La durata massima è ${selectedHistory ? reportDuration(selectedHistory.category) : "24 ore; per gli autovelox mobili è 1 ora"}.`}</p>
+            {inactiveResolved ? <CheckCheck size={32} /> : <CircleHelp size={32} />}
+            <h3>{inactiveResolved ? "La community ha indicato che non è più presente." : inactiveExpired ? "Questa segnalazione è scaduta." : focusedDetail && focusStatus === "missing" ? "Questa segnalazione non è disponibile." : "Questa segnalazione non è più attiva."}</h3>
+            <p>{inactiveResolved ? `Sono stati raggiunti ${CLEAR_VOTE_THRESHOLD} voti di rimozione: il punto è stato tolto dalla mappa.` : focusedDetail && focusStatus === "missing" ? "Il link non corrisponde a una segnalazione disponibile. Puoi consultare gli aggiornamenti sulla mappa." : `Potrebbe essere stata risolta dalla community o essere scaduta. La durata massima è ${selectedHistory ? reportDuration(selectedHistory.category) : "24 ore; per gli autovelox mobili è 1 ora"}.`}</p>
             {confirmError && <div className="form-error" role="alert"><TriangleAlert size={17} />{confirmError}</div>}
+            <button className="text-button" onClick={closeDetail}>Esplora la mappa</button>
             <button className="primary-button" onClick={openNew}><Plus size={17} />Nuova segnalazione</button>
           </div>}
         </Dialog>
@@ -1704,6 +1878,13 @@ export default function App() {
               che ricevono le normali informazioni di connessione e l’area
               visualizzata. Non vengono inviati loro il testo o i dettagli delle
               tue segnalazioni.
+            </p>
+            <h3>Pubblicità</h3>
+            <p>
+              Gli spazi pubblicitari sono separati dalle segnalazioni. Gli
+              annunci Google vengono caricati dopo il consenso alla pubblicità.
+              Quando il servizio è attivo, puoi rivedere la scelta da
+              “Preferenze pubblicità” in fondo alla pagina.
             </p>
             <a
               href="https://osmfoundation.org/wiki/Privacy_Policy"
