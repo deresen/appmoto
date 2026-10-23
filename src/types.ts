@@ -12,6 +12,9 @@ export type Report = {
   expiresAt: string;
   confirmations: number;
   confirmedByMe: boolean;
+  clearVotes: number;
+  clearedByMe: boolean;
+  resolvedAt: string | null;
   source: "community" | "demo";
 };
 export type NewReport = Pick<
@@ -22,4 +25,4 @@ export type NewReport = Pick<
   | "location"
   | "description"
   | "severity"
->;
+> & { allowDuplicate?: boolean };

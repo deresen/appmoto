@@ -1,5 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
+import {
+  CLEAR_VOTE_THRESHOLD,
+  DUPLICATE_RADIUS_METERS,
+  distanceMeters,
+} from "../shared/reportRules.js";
 
 export interface Env {
   ROAD_REPORTS: DurableObjectNamespace<RoadReports>;
@@ -16,6 +21,7 @@ const reportSchema = z.object({
   location: z.string().trim().min(3).max(140),
   description: z.string().trim().max(500).optional().default(""),
   severity: z.enum(["attention", "danger"]),
+  allowDuplicate: z.boolean().optional().default(false),
 }).strict();
 
 type ReportRow = {
@@ -30,6 +36,9 @@ type ReportRow = {
   expires_at: string;
   confirmations: number;
   confirmed_by_me: number;
+  clear_votes: number;
+  cleared_by_me: number;
+  resolved_at: string | null;
 };
 
 class HttpError extends Error {
@@ -61,6 +70,7 @@ function toReport(row: ReportRow) {
     location: row.location, description: row.description, severity: row.severity,
     createdAt: row.created_at, expiresAt: row.expires_at, confirmations: row.confirmations,
     confirmedByMe: Boolean(row.confirmed_by_me), source: "community" as const,
+    clearVotes: row.clear_votes, clearedByMe: Boolean(row.cleared_by_me), resolvedAt: row.resolved_at,
   };
 }
 
@@ -112,9 +122,16 @@ export class RoadReports extends DurableObject<Env> {
         description TEXT NOT NULL,
         severity TEXT NOT NULL CHECK (severity IN ('attention','danger')),
         created_at TEXT NOT NULL,
-        expires_at TEXT NOT NULL
+        expires_at TEXT NOT NULL,
+        resolved_at TEXT
       );
       CREATE TABLE IF NOT EXISTS confirmations (
+        report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+        participant_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (report_id, participant_id)
+      );
+      CREATE TABLE IF NOT EXISTS clear_votes (
         report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
         participant_id TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -127,6 +144,12 @@ export class RoadReports extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS reports_expiry ON reports(expires_at);
     `);
+    const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(reports)").toArray();
+    if (!columns.some(column => column.name === "resolved_at")) {
+      this.sql.exec("ALTER TABLE reports ADD COLUMN resolved_at TEXT");
+    }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS reports_duplicate_lookup
+      ON reports(category, latitude, expires_at) WHERE resolved_at IS NULL`);
     let secret = this.sql.exec<{ value: string }>("SELECT value FROM metadata WHERE key = 'session_key'").toArray()[0]?.value;
     if (!secret) {
       secret = hex(crypto.getRandomValues(new Uint8Array(32)));
@@ -157,17 +180,33 @@ export class RoadReports extends DurableObject<Env> {
 
   private selection = `SELECT r.*,
     (SELECT COUNT(*) FROM confirmations c WHERE c.report_id = r.id) AS confirmations,
-    EXISTS(SELECT 1 FROM confirmations c WHERE c.report_id = r.id AND c.participant_id = ?) AS confirmed_by_me
+    EXISTS(SELECT 1 FROM confirmations c WHERE c.report_id = r.id AND c.participant_id = ?) AS confirmed_by_me,
+    (SELECT COUNT(*) FROM clear_votes v WHERE v.report_id = r.id) AS clear_votes,
+    EXISTS(SELECT 1 FROM clear_votes v WHERE v.report_id = r.id AND v.participant_id = ?) AS cleared_by_me
     FROM reports r`;
 
   private reports(participantId: string) {
-    return this.sql.exec<ReportRow>(`${this.selection} WHERE r.expires_at > ? ORDER BY r.created_at DESC, r.id DESC LIMIT 500`,
-      participantId, new Date().toISOString()).toArray().map(toReport);
+    return this.sql.exec<ReportRow>(`${this.selection} WHERE r.expires_at > ? AND r.resolved_at IS NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 500`,
+      participantId, participantId, new Date().toISOString()).toArray().map(toReport);
   }
 
   private report(id: string, participantId: string) {
-    const row = this.sql.exec<ReportRow>(`${this.selection} WHERE r.id = ?`, participantId, id).toArray()[0];
+    const row = this.sql.exec<ReportRow>(`${this.selection} WHERE r.id = ?`, participantId, participantId, id).toArray()[0];
     return row ? toReport(row) : undefined;
+  }
+
+  private nearbyDuplicates(data: z.infer<typeof reportSchema>, participantId: string, timestamp: string) {
+    // Indexed latitude candidates avoid a full table scan. Exact Haversine
+    // distance also handles reports near the poles and across the date line.
+    const latitudeMargin = DUPLICATE_RADIUS_METERS / 110_000;
+    const candidates = this.sql.exec<ReportRow>(`${this.selection}
+      WHERE r.category = ? AND r.latitude BETWEEN ? AND ? AND r.expires_at > ? AND r.resolved_at IS NULL`,
+      participantId, participantId, data.category, Math.max(-90, data.latitude - latitudeMargin),
+      Math.min(90, data.latitude + latitudeMargin), timestamp).toArray();
+    return candidates.map(row => ({ row, distance: distanceMeters(data.latitude, data.longitude, row.latitude, row.longitude) }))
+      .filter(candidate => candidate.distance <= DUPLICATE_RADIUS_METERS)
+      .sort((a, b) => a.distance - b.distance || a.row.id.localeCompare(b.row.id))
+      .slice(0, 3).map(candidate => toReport(candidate.row));
   }
 
   private broadcast() {
@@ -214,8 +253,8 @@ export class RoadReports extends DurableObject<Env> {
   private async scheduleMaintenance() {
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
-    const nextExpiry = this.sql.exec<{ value: string | null }>("SELECT MIN(expires_at) AS value FROM reports WHERE expires_at > ?", nowIso).toArray()[0]?.value;
-    const nextPurge = this.sql.exec<{ value: string | null }>("SELECT MIN(expires_at) AS value FROM reports WHERE expires_at <= ?", nowIso).toArray()[0]?.value;
+    const nextExpiry = this.sql.exec<{ value: string | null }>("SELECT MIN(expires_at) AS value FROM reports WHERE expires_at > ? AND resolved_at IS NULL", nowIso).toArray()[0]?.value;
+    const nextPurge = this.sql.exec<{ value: string | null }>("SELECT MIN(expires_at) AS value FROM reports").toArray()[0]?.value;
     const nextRate = this.sql.exec<{ value: number | null }>("SELECT MIN(reset_at) AS value FROM rate_windows").toArray()[0]?.value;
     const next = Math.min(nextExpiry ? Date.parse(nextExpiry) : Infinity,
       nextPurge ? Date.parse(nextPurge) + LIFETIME_MS : Infinity, nextRate ?? Infinity);
@@ -259,25 +298,51 @@ export class RoadReports extends DurableObject<Env> {
         const report = parsed.data;
         const id = crypto.randomUUID();
         const now = Date.now();
-        this.sql.exec(`INSERT INTO reports
-          (id, category, latitude, longitude, location, description, severity, created_at, expires_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, report.category, report.latitude, report.longitude,
-          report.location, report.description, report.severity, new Date(now).toISOString(), new Date(now + LIFETIME_MS).toISOString());
+        const result = this.ctx.storage.transactionSync(() => {
+          const duplicates = report.allowDuplicate ? [] : this.nearbyDuplicates(report, participantId, new Date(now).toISOString());
+          if (duplicates.length) return { duplicates };
+          this.sql.exec(`INSERT INTO reports
+            (id, category, latitude, longitude, location, description, severity, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, report.category, report.latitude, report.longitude,
+            report.location, report.description, report.severity, new Date(now).toISOString(), new Date(now + LIFETIME_MS).toISOString());
+          return { report: this.report(id, participantId) };
+        });
+        if (result.duplicates) {
+          return json({ error: "C'è già una segnalazione simile nelle vicinanze.", code: "POSSIBLE_DUPLICATE", duplicates: result.duplicates }, 409, setCookie);
+        }
         await this.scheduleMaintenance();
         this.broadcast();
-        return json({ report: this.report(id, participantId) }, 201, setCookie);
+        return json({ report: result.report }, 201, setCookie);
       }
-      const confirmationMatch = /^\/api\/reports\/([^/]+)\/confirm$/.exec(url.pathname);
-      if (request.method === "POST" && confirmationMatch) {
+      const feedbackMatch = /^\/api\/reports\/([^/]+)\/(confirm|clear)$/.exec(url.pathname);
+      if (request.method === "POST" && feedbackMatch) {
         await readJson(request, true);
-        await this.rateLimit(request, participantId, "confirm", 100);
-        const report = this.report(confirmationMatch[1], participantId);
-        if (!report) throw new HttpError(404, "Segnalazione non trovata.");
-        if (Date.parse(report.expiresAt) <= Date.now()) throw new HttpError(410, "Questa segnalazione è scaduta. Puoi crearne una nuova.");
-        this.sql.exec("INSERT OR IGNORE INTO confirmations (report_id, participant_id, created_at) VALUES (?, ?, ?)", report.id, participantId, new Date().toISOString());
+        await this.rateLimit(request, participantId, "feedback", 100);
+        const report = this.ctx.storage.transactionSync(() => {
+          const existing = this.report(feedbackMatch[1], participantId);
+          if (!existing) throw new HttpError(404, "Segnalazione non trovata.");
+          if (Date.parse(existing.expiresAt) <= Date.now()) throw new HttpError(410, "Questa segnalazione è scaduta. Puoi crearne una nuova.");
+          if (existing.resolvedAt) {
+            if (feedbackMatch[2] === "clear" && existing.clearedByMe) return existing;
+            throw new HttpError(410, "Questa segnalazione è già stata rimossa dalla mappa.");
+          }
+          const timestamp = new Date().toISOString();
+          if (feedbackMatch[2] === "confirm") {
+            this.sql.exec("DELETE FROM clear_votes WHERE report_id = ? AND participant_id = ?", existing.id, participantId);
+            this.sql.exec("INSERT OR IGNORE INTO confirmations (report_id, participant_id, created_at) VALUES (?, ?, ?)", existing.id, participantId, timestamp);
+          } else {
+            this.sql.exec("DELETE FROM confirmations WHERE report_id = ? AND participant_id = ?", existing.id, participantId);
+            this.sql.exec("INSERT OR IGNORE INTO clear_votes (report_id, participant_id, created_at) VALUES (?, ?, ?)", existing.id, participantId, timestamp);
+            const count = this.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM clear_votes WHERE report_id = ?", existing.id).toArray()[0].count;
+            if (count >= CLEAR_VOTE_THRESHOLD) {
+              this.sql.exec("UPDATE reports SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL", timestamp, existing.id);
+            }
+          }
+          return this.report(existing.id, participantId);
+        });
         await this.scheduleMaintenance();
         this.broadcast();
-        return json({ report: this.report(report.id, participantId) }, 200, setCookie);
+        return json({ report }, 200, setCookie);
       }
       throw new HttpError(404, "Endpoint non trovato.");
     } catch (error) {
@@ -292,6 +357,7 @@ export class RoadReports extends DurableObject<Env> {
     const cutoff = new Date(now - LIFETIME_MS).toISOString();
     this.ctx.storage.transactionSync(() => {
       this.sql.exec("DELETE FROM confirmations WHERE report_id IN (SELECT id FROM reports WHERE expires_at <= ?)", cutoff);
+      this.sql.exec("DELETE FROM clear_votes WHERE report_id IN (SELECT id FROM reports WHERE expires_at <= ?)", cutoff);
       this.sql.exec("DELETE FROM reports WHERE expires_at <= ?", cutoff);
       this.sql.exec("DELETE FROM rate_windows WHERE reset_at <= ?", now);
     });

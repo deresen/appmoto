@@ -38,6 +38,11 @@ import {
 } from "lucide-react";
 import MapView from "./MapView";
 import type { Category, NewReport, Report, Severity } from "./types";
+import {
+  CLEAR_VOTE_THRESHOLD,
+  DUPLICATE_RADIUS_METERS,
+  distanceMeters,
+} from "../shared/reportRules";
 
 const CATEGORIES = {
   pothole: {
@@ -107,6 +112,22 @@ function searchable(value: string) {
     .toLocaleLowerCase("it");
 }
 
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+    readonly duplicates?: Report[],
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+function isActive(report: Report) {
+  return !report.resolvedAt && new Date(report.expiresAt).getTime() > Date.now();
+}
+
 async function api<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
     credentials: "same-origin",
@@ -118,16 +139,20 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
           body: JSON.stringify(body),
         }),
   }).catch(() => {
-    throw new Error(
+    throw new ApiError(
       "Connessione non disponibile. Controlla la rete e riprova.",
+      0,
     );
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok)
-    throw new Error(
+    throw new ApiError(
       typeof data.error === "string"
         ? data.error
         : "Non è stato possibile completare la richiesta. Riprova.",
+      response.status,
+      typeof data.code === "string" ? data.code : undefined,
+      Array.isArray(data.duplicates) ? data.duplicates : undefined,
     );
   return data as T;
 }
@@ -245,6 +270,7 @@ export default function App() {
   const [sort, setSort] = useState("recent");
   const [bounds, setBounds] = useState<Bounds | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [lastSelected, setLastSelected] = useState<Report | null>(null);
   const [target, setTarget] = useState<
     (Position & { zoom?: number; key: number }) | null
   >(null);
@@ -257,11 +283,42 @@ export default function App() {
   const [picking, setPicking] = useState(false);
   const [formError, setFormError] = useState("");
   const [sending, setSending] = useState(false);
-  const [confirming, setConfirming] = useState(false);
+  const [voting, setVoting] = useState<{ id: string; action: "confirm" | "clear" } | null>(null);
   const [confirmError, setConfirmError] = useState("");
+  const [duplicateCandidates, setDuplicateCandidates] = useState<Report[] | null>(null);
+  const [duplicateUnavailable, setDuplicateUnavailable] = useState<string[]>([]);
+  const reportsRevision = useRef(0);
+  // Resolution is terminal and report UUIDs are never reused. Only an explicit
+  // resolvedAt creates a tombstone; absence from the capped list does not.
+  const knownResolvedIds = useRef(new Set<string>());
+  const submitInFlight = useRef(false);
+  const voteInFlight = useRef(false);
+  const duplicateRequestKey = useRef<string | null>(null);
   const [locating, setLocating] = useState(false);
   const [toast, setToast] = useState("");
   const [, setTick] = useState(0);
+
+  const draftKey = JSON.stringify(draft);
+  const latestDraftKey = useRef(draftKey);
+  latestDraftKey.current = draftKey;
+  useEffect(() => {
+    duplicateRequestKey.current = null;
+    setDuplicateCandidates(null);
+    setDuplicateUnavailable([]);
+  }, [draftKey]);
+
+  function receiveReports(next: Report[]) {
+    reportsRevision.current += 1;
+    for (const report of next) {
+      if (report.resolvedAt) knownResolvedIds.current.add(report.id);
+    }
+    const active = next.filter((report) => isActive(report) && !knownResolvedIds.current.has(report.id));
+    setReports(active);
+    setLastSelected((previous) => next.find((report) => report.id === previous?.id && report.resolvedAt) ?? previous);
+    setDuplicateCandidates((previous) => previous
+      ?.filter((candidate) => !knownResolvedIds.current.has(candidate.id))
+      .map((candidate) => next.find((report) => report.id === candidate.id) ?? candidate) ?? null);
+  }
 
   useEffect(() => {
     let active = true;
@@ -278,7 +335,7 @@ export default function App() {
       try {
         const data = JSON.parse(value) as { reports?: Report[] };
         if (Array.isArray(data.reports)) {
-          setReports(data.reports);
+          receiveReports(data.reports);
           setConnection("live");
         }
       } catch {
@@ -319,9 +376,10 @@ export default function App() {
     }
     async function connect() {
       try {
+        const requestRevision = reportsRevision.current;
         const initial = await api<{ reports: Report[] }>("/api/reports");
         if (!active) return;
-        setReports(initial.reports);
+        if (requestRevision === reportsRevision.current) receiveReports(initial.reports);
         setLoading(false);
         const health = await api<{ realtime: "sse" | "websocket" }>(
           "/api/health",
@@ -373,9 +431,7 @@ export default function App() {
     return () => clearTimeout(id);
   }, [toast]);
 
-  const activeReports = reports.filter(
-    (report) => new Date(report.expiresAt).getTime() > Date.now(),
-  );
+  const activeReports = reports.filter((report) => isActive(report) && !knownResolvedIds.current.has(report.id));
   const hasExamples = reports.some((report) => report.source === "demo");
   const baseReports = activeReports.filter(
     (report) => showDemo || report.source !== "demo",
@@ -403,13 +459,18 @@ export default function App() {
           Date.parse(b.createdAt) - Date.parse(a.createdAt)
         : Date.parse(b.createdAt) - Date.parse(a.createdAt),
     );
-  const selected = reports.find((report) => report.id === selectedId);
+  const selected = activeReports.find((report) => report.id === selectedId);
+  const selectedHistory = selected ?? (lastSelected?.id === selectedId ? lastSelected : null);
+  useEffect(() => {
+    if (selected) setLastSelected(selected);
+  }, [selected]);
   const communityCount = activeReports.filter(
     (report) => report.source === "community",
   ).length;
 
   function focusReport(report: Report, open = true) {
     setSelectedId(report.id);
+    setLastSelected(report);
     setTarget({
       latitude: report.latitude,
       longitude: report.longitude,
@@ -422,7 +483,6 @@ export default function App() {
     }
   }
   function openNew() {
-    setFormError("");
     setPicking(false);
     setDialog("new");
   }
@@ -459,26 +519,56 @@ export default function App() {
       { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 },
     );
   }
-  async function submitReport(event: FormEvent) {
-    event.preventDefault();
+  function applyMutation(report: Report, requestRevision: number, allowAdd = false) {
+    if (report.resolvedAt) {
+      knownResolvedIds.current.add(report.id);
+      setDuplicateCandidates((previous) => previous?.filter((candidate) => !knownResolvedIds.current.has(candidate.id)) ?? null);
+    } else if (knownResolvedIds.current.has(report.id)) {
+      // A delayed active response cannot undo an explicitly observed resolution.
+      return;
+    }
+    if (!isActive(report)) {
+      reportsRevision.current += 1;
+      setReports((previous) => previous.filter((item) => item.id !== report.id));
+      setLastSelected((previous) => previous?.id === report.id ? report : previous);
+    } else if (reportsRevision.current === requestRevision) {
+      // A later realtime snapshot is authoritative: an older response must not
+      // restore a report that the community has already removed.
+      reportsRevision.current += 1;
+      setReports((previous) => {
+        const exists = previous.some((item) => item.id === report.id);
+        if (!exists && !allowAdd) return previous;
+        return exists
+          ? previous.map((item) => item.id === report.id ? report : item)
+          : [report, ...previous];
+      });
+    }
+  }
+
+  async function publishReport(allowDuplicate = false) {
+    if (submitInFlight.current || voteInFlight.current) return;
+    if (allowDuplicate && duplicateRequestKey.current !== draftKey) {
+      setDuplicateCandidates(null);
+      setFormError("La bozza è cambiata. Ricontrolla la segnalazione prima di pubblicare.");
+      return;
+    }
     if (!draft.position) {
-      setFormError(
-        "Scegli la posizione del pericolo sulla mappa o usa la tua posizione.",
-      );
+      setFormError("Scegli la posizione del pericolo sulla mappa o usa la tua posizione.");
       return;
     }
     if (draft.location.trim().length < 3) {
-      setFormError(
-        "Indica la strada o un punto di riferimento (almeno 3 caratteri).",
-      );
+      setFormError("Indica la strada o un punto di riferimento (almeno 3 caratteri).");
       return;
     }
     if (draft.description.trim().length < 10) {
       setFormError("Descrivi il pericolo con almeno 10 caratteri.");
       return;
     }
+    submitInFlight.current = true;
     setSending(true);
     setFormError("");
+    const requestRevision = reportsRevision.current;
+    const requestKey = draftKey;
     try {
       const body: NewReport = {
         category: draft.category,
@@ -486,54 +576,93 @@ export default function App() {
         location: draft.location.trim(),
         description: draft.description.trim(),
         ...draft.position,
+        ...(allowDuplicate ? { allowDuplicate: true } : {}),
       };
       const { report } = await api<{ report: Report }>("/api/reports", body);
-      setReports((previous) => [
-        report,
-        ...previous.filter((item) => item.id !== report.id),
-      ]);
+      applyMutation(report, requestRevision, true);
       setCategory("all");
       setQuery("");
       setMobileView("map");
       setSelectedId(report.id);
-      setTarget({
-        latitude: report.latitude,
-        longitude: report.longitude,
-        zoom: 14,
-        key: Date.now(),
-      });
+      setLastSelected(report);
+      setTarget({ latitude: report.latitude, longitude: report.longitude, zoom: 14, key: Date.now() });
       setDialog(null);
       setDraft({ ...EMPTY_DRAFT });
+      setDuplicateCandidates(null);
       setToast("Segnalazione pubblicata. Grazie per il tuo contributo!");
     } catch (error) {
-      setFormError(
-        error instanceof Error ? error.message : "Invio non riuscito. Riprova.",
-      );
+      if (error instanceof ApiError && error.status === 409 && error.code === "POSSIBLE_DUPLICATE") {
+        if (latestDraftKey.current !== requestKey) {
+          setFormError("La bozza è cambiata. Premi di nuovo Pubblica per ricontrollarla.");
+          return;
+        }
+        duplicateRequestKey.current = requestKey;
+        for (const report of error.duplicates ?? []) {
+          if (report.resolvedAt) knownResolvedIds.current.add(report.id);
+        }
+        setDuplicateCandidates((error.duplicates ?? []).filter((report) => report.source === "community" && isActive(report) && !knownResolvedIds.current.has(report.id)));
+        setDuplicateUnavailable([]);
+          } else {
+        setFormError(error instanceof Error ? error.message : "Invio non riuscito. Riprova.");
+      }
     } finally {
+      submitInFlight.current = false;
       setSending(false);
     }
   }
-  async function confirmReport() {
-    if (!selected || selected.confirmedByMe || confirming) return;
-    setConfirming(true);
-    setConfirmError("");
+
+  function submitReport(event: FormEvent) {
+    event.preventDefault();
+    // Overriding a duplicate always requires the explicit dedicated button.
+    if (duplicateCandidates !== null) return;
+    void publishReport();
+  }
+
+  async function voteReport(report: Report, action: "confirm" | "clear", fromDuplicate = false) {
+    if (voteInFlight.current || submitInFlight.current) return;
+    if ((action === "confirm" && report.confirmedByMe) || (action === "clear" && report.clearedByMe)) return;
+    voteInFlight.current = true;
+    setVoting({ id: report.id, action });
+    if (fromDuplicate) setFormError("");
+    else setConfirmError("");
+    const requestRevision = reportsRevision.current;
     try {
-      const { report } = await api<{ report: Report }>(
-        `/api/reports/${encodeURIComponent(selected.id)}/confirm`,
-        {},
-      );
-      setReports((previous) =>
-        previous.map((item) => (item.id === report.id ? report : item)),
-      );
-      setToast("Presenza confermata. La community è aggiornata.");
+      const { report: updated } = await api<{ report: Report }>(`/api/reports/${encodeURIComponent(report.id)}/${action}`, {});
+      applyMutation(updated, requestRevision);
+      setDuplicateCandidates((previous) => previous
+        ?.filter((candidate) => !knownResolvedIds.current.has(candidate.id))
+        .map((candidate) => candidate.id === updated.id ? updated : candidate) ?? null);
+      if (fromDuplicate) {
+        setDialog(null);
+        setDraft({ ...EMPTY_DRAFT });
+        setDuplicateCandidates(null);
+        setFormError("");
+        setCategory("all");
+        setQuery("");
+        setMobileView("map");
+        setSelectedId(updated.id);
+        setLastSelected(updated);
+        setTarget({ latitude: updated.latitude, longitude: updated.longitude, zoom: 14, key: Date.now() });
+        setToast("Segnalazione esistente confermata. Nessun duplicato pubblicato.");
+      } else if (action === "clear") {
+        setToast(updated.resolvedAt
+          ? "Raggiunti i voti necessari: la segnalazione è stata rimossa dalla mappa."
+          : `Voto registrato: ${updated.clearVotes}/${CLEAR_VOTE_THRESHOLD} indicazioni di pericolo non più presente.`);
+      } else {
+        setToast("Presenza confermata. Il tuo eventuale voto di rimozione è stato sostituito.");
+      }
     } catch (error) {
-      setConfirmError(
-        error instanceof Error
-          ? error.message
-          : "Conferma non riuscita. Riprova.",
-      );
+      const message = error instanceof Error ? error.message : "Voto non riuscito. Riprova.";
+      if (error instanceof ApiError && (error.status === 404 || error.status === 410)) {
+        reportsRevision.current += 1;
+        setReports((previous) => previous.filter((item) => item.id !== report.id));
+        setDuplicateUnavailable((previous) => [...new Set([...previous, report.id])]);
+      }
+      if (fromDuplicate) setFormError(message);
+      else setConfirmError(message);
     } finally {
-      setConfirming(false);
+      voteInFlight.current = false;
+      setVoting(null);
     }
   }
 
@@ -928,6 +1057,7 @@ export default function App() {
                     </div>
                     <h3>{report.location}</h3>
                     <p>{report.description}</p>
+                    {report.clearVotes > 0 && <span className="card-clear-votes">Verifica rimozione: {report.clearVotes}/{CLEAR_VOTE_THRESHOLD}</span>}
                     <div className="report-card-bottom">
                       <span className="confirmation-count">
                         <ShieldCheck size={14} />
@@ -1057,7 +1187,7 @@ export default function App() {
         <Dialog
           title="Segnala un pericolo"
           onClose={() => {
-            if (!sending) setDialog(null);
+            if (!sending && !voting) setDialog(null);
           }}
           className="new-report-dialog"
         >
@@ -1066,7 +1196,35 @@ export default function App() {
               <p className="dialog-intro">
                 Un'informazione utile a chi percorrerà la tua stessa strada.
               </p>
-              <fieldset>
+              {duplicateCandidates !== null ? (
+                <section className="duplicate-panel" aria-labelledby="duplicate-title">
+                  <div className="duplicate-heading"><Layers size={23} /><div>
+                    <h3 id="duplicate-title">Qualcuno lo ha già segnalato?</h3>
+                    <p>Ci sono segnalazioni dello stesso tipo entro {DUPLICATE_RADIUS_METERS} metri. Se è lo stesso pericolo, confermalo; se è un altro, puoi pubblicarlo comunque.</p>
+                  </div></div>
+                  <div className="duplicate-list">
+                    {duplicateCandidates.map((candidate) => {
+                      const unavailable = !isActive(candidate) || duplicateUnavailable.includes(candidate.id);
+                      const pending = voting?.id === candidate.id;
+                      const confirmed = candidate.confirmedByMe;
+                      return <article className={`duplicate-card ${unavailable ? "duplicate-card--inactive" : ""}`} key={candidate.id} aria-label={`Possibile duplicato: ${candidate.location}`}>
+                        <div className="duplicate-card-heading"><CategoryIcon category={candidate.category} /><div><strong>{candidate.location}</strong><span>{draft.position ? `${Math.round(distanceMeters(draft.position.latitude, draft.position.longitude, candidate.latitude, candidate.longitude))} m dal punto scelto · ` : ""}{ago(candidate.createdAt)}</span></div></div>
+                        <p>{candidate.description}</p>
+                        <span className="duplicate-confirmations"><ShieldCheck size={14} />{candidate.confirmations} conferme di presenza</span>
+                        {unavailable ? <div className="duplicate-result" role="status">Non è più attiva: potrebbe essere risolta o scaduta. La tua bozza è conservata.</div> : <>
+                          <button type="button" className={`duplicate-confirm-button ${confirmed ? "is-confirmed" : ""}`} disabled={sending || Boolean(voting) || confirmed} onClick={() => void voteReport(candidate, "confirm", true)}>
+                            {pending ? <LoaderCircle className="spin" size={17} /> : confirmed ? <CheckCheck size={17} /> : <ThumbsUp size={17} />}
+                            {pending ? "Conferma in corso…" : confirmed ? "Hai confermato questa segnalazione" : "Conferma questa segnalazione"}
+                          </button>
+                        </>}
+                      </article>;
+                    })}
+                    {duplicateCandidates.length === 0 && <p className="duplicate-result">I suggerimenti non sono più disponibili. Puoi tornare alla bozza e ricontrollare prima di pubblicare.</p>}
+                  </div>
+                  <p className="duplicate-draft-note"><ShieldCheck size={15} />La tua bozza resta salvata in questa schermata, anche se una conferma non riesce.</p>
+                </section>
+              ) : (<>
+              <fieldset disabled={sending || Boolean(voting)}>
                 <legend>
                   <span>01</span>Che cosa hai incontrato?
                 </legend>
@@ -1096,7 +1254,7 @@ export default function App() {
                   })}
                 </div>
               </fieldset>
-              <fieldset>
+              <fieldset disabled={sending || Boolean(voting)}>
                 <legend>
                   <span>02</span>Dove si trova?
                 </legend>
@@ -1160,7 +1318,7 @@ export default function App() {
                   }
                 />
               </fieldset>
-              <fieldset>
+              <fieldset disabled={sending || Boolean(voting)}>
                 <legend>
                   <span>03</span>Aggiungi i dettagli
                 </legend>
@@ -1219,6 +1377,7 @@ export default function App() {
                   </button>
                 </div>
               </fieldset>
+              </>)}
               {formError && (
                 <div className="form-error" role="alert">
                   <TriangleAlert size={17} />
@@ -1231,159 +1390,73 @@ export default function App() {
                 segnalazione scade dopo 24 ore.
               </p>
             </div>
-            <div className="dialog-footer">
-              <span>Segnala solo dopo esserti fermato.</span>
-              <button
-                className="primary-button"
-                type="submit"
-                disabled={sending || locating}
-              >
-                {sending ? (
-                  <LoaderCircle className="spin" size={18} />
-                ) : (
-                  <Plus size={18} />
-                )}
-                {sending ? "Pubblicazione…" : "Pubblica segnalazione"}
-              </button>
+            <div className={`dialog-footer ${duplicateCandidates !== null ? "duplicate-footer" : ""}`}>
+              {duplicateCandidates !== null ? <>
+                <button className="text-button" type="button" disabled={sending || Boolean(voting)} onClick={() => { setDuplicateCandidates(null); setFormError(""); }}>Torna a modificare la bozza</button>
+                <button className="primary-button duplicate-force-button" type="button" disabled={sending || Boolean(voting) || locating} onClick={() => void publishReport(true)}>
+                  {sending ? <LoaderCircle className="spin" size={18} /> : <Plus size={18} />}
+                  {sending ? "Pubblicazione…" : "È un altro pericolo: pubblica comunque"}
+                </button>
+              </> : <>
+                <span>Segnala solo dopo esserti fermato.</span>
+                <button className="primary-button" type="submit" disabled={sending || Boolean(voting) || locating}>
+                  {sending ? <LoaderCircle className="spin" size={18} /> : <Plus size={18} />}
+                  {sending ? "Pubblicazione…" : "Pubblica segnalazione"}
+                </button>
+              </>}
             </div>
           </form>
         </Dialog>
       )}
 
       {dialog === "detail" && (
-        <Dialog
-          title={
-            selected
-              ? CATEGORIES[selected.category].singular
-              : "Segnalazione non più attiva"
-          }
-          onClose={() => setDialog(null)}
-          className="detail-dialog"
-        >
-          {selected && new Date(selected.expiresAt).getTime() > Date.now() ? (
-            <>
-              <div className="dialog-content">
-                <div className="detail-category">
-                  <CategoryIcon category={selected.category} size={27} />
-                  <span
-                    className={`severity-badge ${selected.severity === "danger" ? "is-danger" : ""}`}
-                  >
-                    <span />
-                    {selected.severity === "danger"
-                      ? "Pericolo elevato"
-                      : "Attenzione"}
-                  </span>
-                  <span className="detail-age">{ago(selected.createdAt)}</span>
-                </div>
-                <h3 className="detail-location">{selected.location}</h3>
-                <p className="detail-description">{selected.description}</p>
-                {selected.source === "demo" && (
-                  <div className="demo-detail">
-                    <Sparkles size={18} />
-                    <div>
-                      <strong>Segnalazione di esempio</strong>
-                      <p>
-                        Serve a esplorare Passo e non descrive le condizioni
-                        reali della strada.
-                      </p>
-                    </div>
-                  </div>
-                )}
-                <div className="detail-facts">
-                  <div>
-                    <MapPin size={17} />
-                    <span>
-                      Punto segnalato
-                      <strong>
-                        {selected.latitude.toFixed(5)},{" "}
-                        {selected.longitude.toFixed(5)}
-                      </strong>
-                    </span>
-                  </div>
-                  <div>
-                    <ShieldCheck size={17} />
-                    <span>
-                      Conferme della community
-                      <strong>
-                        {selected.confirmations}{" "}
-                        {selected.confirmations === 1
-                          ? "persona ha confermato"
-                          : "persone hanno confermato"}
-                        {selected.confirmedByMe ? ", te compreso" : ""}
-                      </strong>
-                    </span>
-                  </div>
-                  <div>
-                    <Radio size={17} />
-                    <span>
-                      Visibile fino alle
-                      <strong>
-                        {new Date(selected.expiresAt).toLocaleTimeString(
-                          "it-IT",
-                          { hour: "2-digit", minute: "2-digit" },
-                        )}{" "}
-                        del{" "}
-                        {new Date(selected.expiresAt).toLocaleDateString(
-                          "it-IT",
-                          { day: "numeric", month: "long" },
-                        )}
-                      </strong>
-                    </span>
-                  </div>
-                </div>
-                <div className="confirm-explainer">
-                  <h4>Il pericolo è ancora presente?</h4>
-                  <p>
-                    Conferma se sei passato di qui e lo hai verificato. Aiuterai
-                    chi arriva dopo.
-                  </p>
-                </div>
-                {confirmError && (
-                  <div className="form-error" role="alert">
-                    <TriangleAlert size={17} />
-                    {confirmError}
-                  </div>
-                )}
+        <Dialog title={selected && isActive(selected) ? CATEGORIES[selected.category].singular : "Segnalazione non più attiva"} onClose={() => setDialog(null)} className="detail-dialog">
+          {selected && isActive(selected) ? <>
+            <div className="dialog-content">
+              <div className="detail-category">
+                <CategoryIcon category={selected.category} size={27} />
+                <span className={`severity-badge ${selected.severity === "danger" ? "is-danger" : ""}`}><span />{selected.severity === "danger" ? "Pericolo elevato" : "Attenzione"}</span>
+                <span className="detail-age">{ago(selected.createdAt)}</span>
               </div>
-              <div className="dialog-footer detail-footer">
-                <span>
-                  <ShieldCheck size={15} />
-                  Una conferma per browser.
-                </span>
-                <button
-                  className={`primary-button ${selected.confirmedByMe ? "confirmed-button" : ""}`}
-                  onClick={confirmReport}
-                  disabled={selected.confirmedByMe || confirming}
-                >
-                  {confirming ? (
-                    <LoaderCircle className="spin" size={18} />
-                  ) : selected.confirmedByMe ? (
-                    <CheckCheck size={18} />
-                  ) : (
-                    <ThumbsUp size={18} />
-                  )}
-                  {selected.confirmedByMe
-                    ? "Hai confermato"
-                    : confirming
-                      ? "Conferma in corso…"
-                      : "Confermo, è presente"}
+              <h3 className="detail-location">{selected.location}</h3>
+              <p className="detail-description">{selected.description}</p>
+              {selected.source === "demo" && <div className="demo-detail"><Sparkles size={18} /><div><strong>Segnalazione di esempio</strong><p>Serve a esplorare Passo e non descrive le condizioni reali della strada.</p></div></div>}
+              <div className="detail-facts">
+                <div><MapPin size={17} /><span>Punto segnalato<strong>{selected.latitude.toFixed(5)}, {selected.longitude.toFixed(5)}</strong></span></div>
+                <div><ShieldCheck size={17} /><span>Presenza segnalata dalla community<strong>{selected.confirmations} {selected.confirmations === 1 ? "conferma" : "conferme"}{selected.confirmedByMe ? ", inclusa la tua" : ""}</strong></span></div>
+                <div><Radio size={17} /><span>Visibile fino alle<strong>{new Date(selected.expiresAt).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })} del {new Date(selected.expiresAt).toLocaleDateString("it-IT", { day: "numeric", month: "long" })}</strong></span></div>
+              </div>
+              <div className="confirm-explainer">
+                <h4>Che cosa hai trovato passando di qui?</h4>
+                <p>Indica solo ciò che hai osservato. Puoi cambiare voto: la nuova osservazione sostituisce quella precedente.</p>
+              </div>
+              <div className={`clear-progress ${selected.clearedByMe ? "clear-progress--voted" : ""}`} role="status">
+                <div><CheckCheck size={17} /><span>Non più presente</span><strong>{selected.clearVotes}/{CLEAR_VOTE_THRESHOLD} voti</strong></div>
+                <progress value={selected.clearVotes} max={CLEAR_VOTE_THRESHOLD} aria-label={`Voti di rimozione: ${selected.clearVotes} su ${CLEAR_VOTE_THRESHOLD}`} />
+                <p>La segnalazione scompare dopo {CLEAR_VOTE_THRESHOLD} voti di browser diversi. {selected.clearedByMe ? "Il tuo voto è incluso." : "Nel frattempo resta visibile."}</p>
+              </div>
+              {confirmError && <div className="form-error" role="alert"><TriangleAlert size={17} />{confirmError}</div>}
+            </div>
+            <div className="dialog-footer detail-footer detail-vote-footer">
+              <span><ShieldCheck size={15} />Un'osservazione per browser. Puoi cambiarla.</span>
+              <div className="report-vote-actions">
+                <button className={`clear-vote-button ${selected.clearedByMe ? "is-voted" : ""}`} onClick={() => void voteReport(selected, "clear")} disabled={selected.clearedByMe || Boolean(voting)} aria-pressed={selected.clearedByMe}>
+                  {voting?.id === selected.id && voting.action === "clear" ? <LoaderCircle className="spin" size={17} /> : <CheckCheck size={17} />}
+                  {voting?.id === selected.id && voting.action === "clear" ? "Invio del voto…" : "Non è più presente"}
+                </button>
+                <button className={`primary-button ${selected.confirmedByMe ? "confirmed-button" : ""}`} onClick={() => void voteReport(selected, "confirm")} disabled={selected.confirmedByMe || Boolean(voting)} aria-pressed={selected.confirmedByMe}>
+                  {voting?.id === selected.id && voting.action === "confirm" ? <LoaderCircle className="spin" size={17} /> : selected.confirmedByMe ? <CheckCheck size={17} /> : <ThumbsUp size={17} />}
+                  {selected.confirmedByMe ? "Hai confermato" : voting?.id === selected.id && voting.action === "confirm" ? "Conferma in corso…" : "Confermo, è presente"}
                 </button>
               </div>
-            </>
-          ) : (
-            <div className="dialog-content empty-state">
-              <CircleHelp size={32} />
-              <h3>Questa segnalazione è scaduta.</h3>
-              <p>
-                Le segnalazioni rimangono visibili per 24 ore. Se il pericolo è
-                ancora presente, puoi aggiungerne una nuova.
-              </p>
-              <button className="primary-button" onClick={openNew}>
-                <Plus size={17} />
-                Nuova segnalazione
-              </button>
             </div>
-          )}
+          </> : <div className="dialog-content empty-state inactive-report-state" role="status">
+            {selectedHistory?.resolvedAt ? <CheckCheck size={32} /> : <CircleHelp size={32} />}
+            <h3>{selectedHistory?.resolvedAt ? "La community ha indicato che non è più presente." : selectedHistory && new Date(selectedHistory.expiresAt).getTime() <= Date.now() ? "Questa segnalazione è scaduta." : "Questa segnalazione non è più attiva."}</h3>
+            <p>{selectedHistory?.resolvedAt ? `Sono stati raggiunti ${CLEAR_VOTE_THRESHOLD} voti di rimozione: il punto è stato tolto dalla mappa.` : "Potrebbe essere stata risolta dalla community o essere scaduta. Le segnalazioni restano visibili per un massimo di 24 ore."}</p>
+            {confirmError && <div className="form-error" role="alert"><TriangleAlert size={17} />{confirmError}</div>}
+            <button className="primary-button" onClick={openNew}><Plus size={17} />Nuova segnalazione</button>
+          </div>}
         </Dialog>
       )}
 
@@ -1404,7 +1477,8 @@ export default function App() {
                 <h3>Segnala quello che incontri.</h3>
                 <p>
                   Indica un punto preciso, scegli il tipo di pericolo e
-                  descrivilo. La segnalazione viene condivisa subito.
+                  descrivilo. Se c'è una segnalazione simile entro {DUPLICATE_RADIUS_METERS} metri,
+                  puoi confermarla oppure indicare che si tratta di un altro pericolo.
                 </p>
               </div>
             </div>
@@ -1413,8 +1487,9 @@ export default function App() {
               <div>
                 <h3>Conferma quello che hai visto.</h3>
                 <p>
-                  Se un pericolo è ancora presente, confermalo. Ogni browser può
-                  aggiungere una sola conferma per segnalazione.
+                  Se un pericolo è ancora presente, confermalo. Se non c'è più,
+                  indicalo: dopo {CLEAR_VOTE_THRESHOLD} voti di browser diversi scompare dalla mappa.
+                  Puoi cambiare osservazione; ogni browser esprime un solo voto alla volta.
                 </p>
               </div>
             </div>
@@ -1474,8 +1549,8 @@ export default function App() {
             </p>
             <h3>Conferme e memoria del browser</h3>
             <p>
-              Un cookie tecnico anonimo permette di riconoscere le tue conferme
-              ed evitare duplicati nello stesso browser. Non è un account
+              Un cookie tecnico anonimo permette di riconoscere il tuo voto di
+              presenza o rimozione e di sostituirlo quando cambi osservazione. Non è un account
               personale e non identifica in modo affidabile una persona.
             </p>
             <h3>La mappa</h3>

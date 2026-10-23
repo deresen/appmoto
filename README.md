@@ -1,8 +1,16 @@
 # Passo
 
-Una prima versione in italiano, pensata per smartphone, per segnalare **buche, ghiaia, olio, ostacoli e chiusure** sulla mappa e confermare se sono ancora presenti. Inserimenti e conferme si aggiornano nelle altre sessioni senza ricaricare la pagina.
+Una prima versione in italiano, pensata per smartphone, per segnalare **buche, ghiaia, olio, ostacoli e chiusure** sulla mappa, confermare se sono ancora presenti e indicare quando sono risolti. Inserimenti, voti e rimozioni si aggiornano nelle altre sessioni senza ricaricare la pagina.
 
 La pubblicazione prevista usa **Cloudflare Workers Free**, risorse statiche e un **Durable Object con SQLite persistente**. Non richiede un server Node a pagamento o un disco effimero. Il percorso usa il sottodominio gratuito `workers.dev`: non occorre comprare un dominio. Un account Render eventualmente creato non serve e non è necessario attivarvi servizi o dischi.
+
+## Segnalazioni presenti, risolte e possibili duplicati
+
+- **Confermo, è presente** conferma il pericolo; **Non è più presente** aggiunge un voto alla sua risoluzione. Ogni browser può avere un solo voto per segnalazione: scegliere l'altra azione sostituisce il proprio voto precedente. Ripetere la stessa azione non aumenta il conteggio.
+- Con **tre voti di risoluzione di browser distinti**, la segnalazione viene rimossa dalla mappa e dagli aggiornamenti di tutti. La risoluzione è definitiva per quella segnalazione: un nuovo pericolo richiede un nuovo inserimento. I browser non equivalgono a persone verificate; cancellare i cookie o usare altri browser può aggirare questo riconoscimento.
+- Prima di inserire una segnalazione, il server cerca altre segnalazioni community attive dello **stesso tipo entro 75 metri**. In caso di possibile duplicato restituisce fino alle tre più vicine senza inserire nuovi dati. Si può confermare quella esistente oppure proseguire esplicitamente se si tratta di un pericolo distinto. Gli esempi dimostrativi, le segnalazioni scadute e quelle risolte non bloccano l'inserimento.
+
+Nessuno dei voti prolunga la scadenza: rimane **24 ore dalla creazione**. La migrazione del database aggiunge i voti di risoluzione e il relativo stato conservando segnalazioni, conferme e sessioni già esistenti.
 
 ## Sviluppo locale
 
@@ -30,11 +38,11 @@ Wrangler esegue la build configurata e avvia l'app sulla porta `8787`, con API, 
 
 ## Pubblicazione gratuita
 
-Non è stata ancora verificata una distribuzione sull'account Cloudflare dell'utente. Per pubblicare occorre creare o usare il proprio account e mantenere il piano **Workers Free**, senza attivare Workers Paid o altri prodotti a pagamento.
+Una versione precedente è stata pubblicata su **https://appmoto.angellotti-gius.workers.dev** e l'utente ne ha confermato il funzionamento. Le nuove modifiche richiedono una nuova distribuzione prima di essere disponibili online. Per pubblicare occorre creare o usare il proprio account e mantenere il piano **Workers Free**, senza attivare Workers Paid o altri prodotti a pagamento.
 
 1. Salva il codice nel repository GitHub `deresen/appmoto`. Il codice presente soltanto nel workspace non è disponibile alla piattaforma di pubblicazione; escludi database, `.env` e credenziali.
 2. Nel [dashboard Cloudflare](https://dash.cloudflare.com/) apri **Workers & Pages → Create application → GitHub**, autorizza il collegamento e scegli il repository.
-3. Il nome del Worker deve corrispondere a `name` in `wrangler.jsonc`. Usa `npm run deploy` come comando di distribuzione: Wrangler esegue la build personalizzata configurata. Workers Builds gestisce l'autenticazione nel dashboard; non occorre incollare un token in chat.
+3. Il Worker esistente si chiama **`appmoto`**, come `name` in `wrangler.jsonc`; **Passo** resta il nome dell'app. Usa `npm run deploy` come comando di distribuzione: Wrangler esegue la build personalizzata configurata. Workers Builds gestisce l'autenticazione nel dashboard; non occorre incollare un token in chat.
 4. Apri l'URL HTTPS `workers.dev` assegnato. Verifica la mappa, pubblica una segnalazione e confermala da una seconda sessione con cookie separati. Controlla gli aggiornamenti senza ricaricare e la permanenza del dato dopo una nuova visita o distribuzione.
 
 In alternativa, dalla propria macchina si può eseguire `npx wrangler login` e poi `npm run deploy`. Il login avviene nel browser con il proprio account. Non serve un servizio realtime separato né una sua chiave API.
@@ -63,15 +71,17 @@ npm test
 npm run build
 ```
 
-La suite include controlli isolati del backend Node e del Worker nel runtime locale. Un test locale riuscito non dimostra che la distribuzione online sia avvenuta. L'endpoint `/api/health` permette di distinguere il backend locale SQLite/SSE dal Worker SQLite/WebSocket.
+La suite include controlli isolati del backend Node e del Worker nel runtime locale: voti esclusivi e idempotenti, risoluzione definitiva, rimozione in SSE/WebSocket, duplicati e migrazione da database precedenti con riavvio. I test Cloudflare usano soltanto workerd locale e non pubblicano risorse sull'account. Un test locale riuscito non dimostra che la distribuzione online sia avvenuta. L'endpoint `/api/health` permette di distinguere il backend locale SQLite/SSE dal Worker SQLite/WebSocket.
 
 Per il controllo funzionale usa due sessioni con cookie separati, per esempio una finestra normale e una privata: crea una segnalazione nella prima, verifica che compaia nella seconda, confermala dalla seconda e verifica l'aggiornamento nella prima. Controlla anche che una seconda conferma dallo stesso browser non aumenti il conteggio.
 
+Prova poi **Non è più presente**: la conferma dello stesso browser deve essere sostituita. Con tre sessioni distinte, il terzo voto di risoluzione deve rimuovere il punto da tutte le mappe. Per provare i duplicati, tenta un inserimento dello stesso tipo vicino a un punto community attivo: deve comparire l'alternativa di usare quello esistente, senza aggiungere una nuova segnalazione salvo scelta esplicita del pericolo distinto.
+
 ## Dati e privacy
 
-- In Cloudflare, segnalazioni e conferme risiedono nello SQLite persistente di un singolo Durable Object globale; non dipendono dal filesystem temporaneo del Worker. La pubblicazione parte senza esempi.
-- Ogni segnalazione resta visibile per **24 ore dalla creazione**. Le conferme non ne prolungano la durata. L'API restituisce al massimo le **500 segnalazioni attive più recenti**: ricerca e filtri operano sui dati caricati, non su un geocodificatore esterno.
-- Un cookie tecnico anonimo HttpOnly, e Secure su HTTPS, riconosce le conferme dello stesso browser. Non equivale a un account e non impedisce abusi da browser differenti. App e API usano la stessa origine.
+- In Cloudflare, segnalazioni, conferme e voti Risolto risiedono nello SQLite persistente di un singolo Durable Object globale; non dipendono dal filesystem temporaneo del Worker. La pubblicazione parte senza esempi.
+- Ogni segnalazione resta visibile per **24 ore dalla creazione**, oppure fino alla risoluzione se precedente. I voti non ne prolungano la durata. L'API restituisce al massimo le **500 segnalazioni attive più recenti**: ricerca e filtri operano sui dati caricati, non su un geocodificatore esterno. Il controllo dei duplicati considera anche le segnalazioni attive fuori da questo limite.
+- Un cookie tecnico anonimo HttpOnly, e Secure su HTTPS, riconosce i voti dello stesso browser. Non equivale a un account e non impedisce abusi da browser differenti. App e API usano la stessa origine.
 - La posizione viene richiesta soltanto su azione dell'utente, senza tracciamento continuo. Quando si pubblica vengono condivisi il punto scelto, la categoria e il testo: non inserire dati personali.
 - Prima di un lancio pubblico più ampio servono moderazione, misure antiabuso adeguate, backup e una politica di conservazione e cancellazione dei dati. La scadenza della visibilità non va confusa con una politica completa di cancellazione.
 

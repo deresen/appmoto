@@ -13,6 +13,9 @@ interface Report {
   source: string;
   confirmations: number;
   confirmedByMe: boolean;
+  clearVotes: number;
+  clearedByMe: boolean;
+  resolvedAt: string | null;
   createdAt: string;
   expiresAt: string;
   location: string;
@@ -260,8 +263,127 @@ test("Cloudflare: API, asset, SQLite e WebSocket reali nel runtime locale worker
       assert.equal((await (await restored.post(`/api/reports/${createdId}/confirm`)).json()).report.confirmations, 1);
     });
 
+    await t.test("voti risolto esclusivi, idempotenti e concorrenti; il terzo voto rimuove la segnalazione dai WebSocket", async () => {
+      const voters = [browser(instance!.base), browser(instance!.base), browser(instance!.base)];
+      for (const voter of voters) await (await voter.request("/api/health")).json();
+      const creation = await voters[0].post("/api/reports", { ...validReport, latitude: validReport.latitude + 0.02 });
+      assert.equal(creation.status, 201);
+      const { report: original } = await creation.json();
+      const path = `/api/reports/${original.id}`;
+      const sockets = [await socketFor(instance!.base, voters[0].cookie), await socketFor(instance!.base, voters[1].cookie)];
+      try {
+        for (const socket of sockets) assert((await socket.next()).some(report => report.id === original.id));
+        const confirmation = await voters[0].post(`${path}/confirm`, {});
+        assert.equal(confirmation.status, 200);
+        await confirmation.json();
+        for (const socket of sockets) await socket.next();
+        const clear = await voters[0].post(`${path}/clear`, {});
+        assert.equal(clear.status, 200);
+        const { report: cleared } = await clear.json();
+        assert.equal(cleared.clearVotes, 1);
+        assert.equal(cleared.confirmations, 0);
+        assert.equal(cleared.confirmedByMe, false);
+        assert.equal(cleared.clearedByMe, true);
+        assert.equal(cleared.expiresAt, original.expiresAt);
+        const views = await Promise.all(sockets.map(socket => socket.next()));
+        assert.equal(views[0].find(report => report.id === original.id)?.clearedByMe, true);
+        assert.equal(views[1].find(report => report.id === original.id)?.clearedByMe, false);
+        const back = await voters[0].post(`${path}/confirm`);
+        assert.equal(back.status, 200);
+        const { report: confirmed } = await back.json();
+        assert.equal(confirmed.clearVotes, 0);
+        assert.equal(confirmed.confirmations, 1);
+        for (const socket of sockets) await socket.next();
+      } finally {
+        for (const socket of sockets) socket.close();
+      }
+      const repeats = await Promise.all([
+        voters[0].post(`${path}/clear`), voters[0].post(`${path}/clear`, {}), voters[0].post(`${path}/clear`),
+      ]);
+      for (const response of repeats) {
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).report.clearVotes, 1);
+      }
+      const blocked = await voters[0].request(`${path}/clear`, { method: "POST", headers: { Origin: "https://untrusted.example" } });
+      assert.equal(blocked.status, 403);
+      await blocked.json();
+      const second = await voters[1].post(`${path}/clear`, {});
+      assert.equal(second.status, 200);
+      assert.equal((await second.json()).report.clearVotes, 2);
+      const removalSockets = [await socketFor(instance!.base, voters[0].cookie), await socketFor(instance!.base, voters[1].cookie)];
+      let resolved: Report;
+      try {
+        for (const socket of removalSockets) assert((await socket.next()).some(report => report.id === original.id));
+        const resolution = await voters[2].post(`${path}/clear`, {});
+        assert.equal(resolution.status, 200);
+        resolved = (await resolution.json()).report;
+        assert.equal(resolved.clearVotes, 3);
+        assert(resolved.resolvedAt);
+        assert.equal(resolved.expiresAt, original.expiresAt);
+        for (const socket of removalSockets) {
+          assert(!(await socket.next()).some(report => report.id === original.id), "resolution must remove the report from an existing WebSocket");
+        }
+      } finally {
+        for (const socket of removalSockets) socket.close();
+      }
+      for (const voter of voters) {
+        const repeat = await voter.post(`${path}/clear`);
+        assert.equal(repeat.status, 200);
+        assert.equal((await repeat.json()).report.resolvedAt, resolved.resolvedAt);
+        const revival = await voter.post(`${path}/confirm`, {});
+        assert.equal(revival.status, 410);
+        await revival.json();
+      }
+      const newVote = await browser(instance!.base).post(`${path}/clear`, {});
+      assert.equal(newVote.status, 410);
+      await newVote.json();
+      const replacement = await voters[0].post("/api/reports", { ...validReport, latitude: validReport.latitude + 0.02 });
+      assert.equal(replacement.status, 201, "resolved reports cannot block a new hazard");
+      await replacement.json();
+    });
+
+    await t.test("duplicati entro 75m: massimo tre più vicini, categoria, override e creazione concorrente", async () => {
+      const author = browser(instance!.base);
+      const atDistance = (metres: number) => ({
+        ...validReport, latitude: validReport.latitude + 1 + metres / 6_371_000 * 180 / Math.PI,
+      });
+      const initial = await author.post("/api/reports", atDistance(0));
+      assert.equal(initial.status, 201);
+      const firstId = (await initial.json()).report.id;
+      const inside = await author.post("/api/reports", atDistance(74.99));
+      assert.equal(inside.status, 409);
+      const insideBody = await inside.json();
+      assert.equal(insideBody.code, "POSSIBLE_DUPLICATE");
+      assert.deepEqual(insideBody.duplicates.map((report: Report) => report.id), [firstId]);
+      const outside = await author.post("/api/reports", atDistance(75.01));
+      assert.equal(outside.status, 201);
+      await outside.json();
+      const category = await author.post("/api/reports", { ...atDistance(0), category: "oil" });
+      assert.equal(category.status, 201);
+      await category.json();
+      const nearest = [firstId];
+      for (const metres of [20, 40, 60]) {
+        const distinct = await author.post("/api/reports", { ...atDistance(metres), allowDuplicate: true });
+        assert.equal(distinct.status, 201);
+        nearest.push((await distinct.json()).report.id);
+      }
+      const before = (await (await author.request("/api/reports")).json()).reports.length;
+      const conflict = await author.post("/api/reports", atDistance(0));
+      assert.equal(conflict.status, 409);
+      const body = await conflict.json();
+      assert.equal(body.code, "POSSIBLE_DUPLICATE");
+      assert.equal(typeof body.error, "string");
+      assert.deepEqual(body.duplicates.map((report: Report) => report.id), nearest.slice(0, 3));
+      assert.equal((await (await author.request("/api/reports")).json()).reports.length, before);
+      const concurrentReport = { ...validReport, latitude: validReport.latitude + 2 };
+      const race = await Promise.all([author.post("/api/reports", concurrentReport), author.post("/api/reports", concurrentReport)]);
+      assert.deepEqual(race.map(response => response.status).sort(), [201, 409]);
+      for (const response of race) await response.json();
+    });
+
     await t.test("mantiene il limite antiabuso dopo un riavvio e un cambio di browser", async () => {
       const limited = browser(instance!.base, savedCookie);
+      const before = (await (await limited.request("/api/reports")).json()).reports.length;
       let rejected = false;
       for (let attempt = 0; attempt < 21; attempt++) {
         const response = await limited.post("/api/reports", { ...validReport, latitude: 91 });
@@ -277,10 +399,143 @@ test("Cloudflare: API, asset, SQLite e WebSocket reali nel runtime locale worker
       assert.equal(response.status, 429, "riavvio e nuovo cookie non devono azzerare il limite IP");
       await response.json();
       const { reports } = await (await newBrowser.request("/api/reports")).json();
-      assert.equal(reports.length, 1, "la richiesta limitata non deve inserire un report");
+      assert.equal(reports.length, before, "la richiesta limitata non deve inserire un report");
     });
   } finally {
     firstSocket?.close(); secondSocket?.close();
+    await instance?.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Cloudflare migrates actual legacy Durable Object SQLite state and retains browser identity across restarts", { timeout: 120_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "passo-cloud-legacy-"));
+  const configPath = join(directory, "wrangler.json");
+  const legacyPath = join(directory, "legacy.ts");
+  // An isolated previous-version Worker creates genuine persisted workerd
+  // state. No private Miniflare directory or database filename is assumed.
+  await writeFile(legacyPath, `
+    import { DurableObject } from "cloudflare:workers";
+    const identity = "1234567890abcdef1234567890abcdef";
+    const secret = "12".repeat(32);
+    const encoder = new TextEncoder();
+    const hex = value => [...new Uint8Array(value)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+    export class RoadReports extends DurableObject {
+      constructor(ctx, env) {
+        super(ctx, env);
+        this.sql = ctx.storage.sql;
+        this.sql.exec(\`CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS reports (
+            id TEXT PRIMARY KEY, category TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL,
+            location TEXT NOT NULL, description TEXT NOT NULL, severity TEXT NOT NULL,
+            created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS confirmations (
+            report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+            participant_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (report_id, participant_id));
+          CREATE TABLE IF NOT EXISTS rate_windows (bucket TEXT PRIMARY KEY, count INTEGER NOT NULL, reset_at INTEGER NOT NULL);
+        \`);
+      }
+      async fetch() {
+        const participant = hex(await crypto.subtle.digest("SHA-256", encoder.encode(identity)));
+        if (!this.sql.exec("SELECT key FROM metadata WHERE key = 'session_key'").toArray().length) {
+          const now = Date.now();
+          this.ctx.storage.transactionSync(() => {
+            this.sql.exec("INSERT INTO metadata VALUES ('session_key', ?)", secret);
+            const insert = (id, category, latitude, created, expires) => this.sql.exec(
+              "INSERT INTO reports VALUES (?, ?, ?, ?, 'Legacy road', 'Legacy report', 'attention', ?, ?)",
+              id, category, latitude, ${validReport.longitude}, new Date(created).toISOString(), new Date(expires).toISOString());
+            insert("legacy-active", "pothole", ${validReport.latitude}, now - 1000, now + 86_400_000);
+            insert("legacy-expired", "pothole", ${validReport.latitude + 3}, now - 90_000_000, now - 1000);
+            for (let index = 0; index < 500; index++) insert("filler-" + index, "oil", 0, now, now + 86_400_000);
+            this.sql.exec("INSERT INTO confirmations VALUES ('legacy-active', ?, ?)", participant, new Date(now).toISOString());
+          });
+        }
+        const key = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(0x12), {name:"HMAC", hash:"SHA-256"}, false, ["sign"]);
+        const signature = hex(await crypto.subtle.sign("HMAC", key, encoder.encode(identity)));
+        return new Response(JSON.stringify({status:"ok",storage:"sqlite",realtime:"websocket"}), {headers:{
+          "Content-Type":"application/json", "Set-Cookie":"passo_session=" + identity + "." + signature + "; Path=/; HttpOnly; SameSite=Lax"
+        }});
+      }
+    }
+    export default {fetch(request, env) {return env.ROAD_REPORTS.get(env.ROAD_REPORTS.idFromName("global")).fetch(request);}};
+  `);
+  const config = {
+    name: "passo-cloud-legacy", main: legacyPath, compatibility_date: "2026-10-19",
+    durable_objects: { bindings: [{ name: "ROAD_REPORTS", class_name: "RoadReports" }] },
+    migrations: [{ tag: "v1", new_sqlite_classes: ["RoadReports"] }],
+  };
+  await writeFile(configPath, JSON.stringify(config));
+  const port = await availablePort();
+  let instance: Awaited<ReturnType<typeof startWorker>> | undefined;
+  try {
+    instance = await startWorker(directory, port);
+    const legacy = browser(instance.base);
+    await (await legacy.request("/api/health")).json();
+    const cookie = legacy.cookie;
+    assert(cookie.startsWith("passo_session="));
+    await instance.stop();
+    await writeFile(configPath, JSON.stringify({ ...config, main: resolve("worker/index.ts") }));
+    instance = await startWorker(directory, port);
+    let restored = browser(instance.base, cookie);
+    const listing = await restored.request("/api/reports");
+    assert.equal(listing.headers.get("set-cookie"), null, "the legacy session signing key must survive migration");
+    const { reports } = await listing.json();
+    assert.equal(reports.length, 500);
+    assert(!reports.some((report: Report) => report.id === "legacy-active"));
+    const conflict = await restored.post("/api/reports", validReport);
+    assert.equal(conflict.status, 409, "Worker duplicate checks must find a legacy report outside the map's 500-report cap");
+    const conflictBody = await conflict.json();
+    assert.equal(conflictBody.code, "POSSIBLE_DUPLICATE");
+    assert.equal(conflictBody.duplicates.length, 1);
+    const legacyReport = conflictBody.duplicates[0];
+    assert.equal(legacyReport.id, "legacy-active");
+    assert.equal(legacyReport.confirmations, 1);
+    assert.equal(legacyReport.confirmedByMe, true);
+    assert.equal(legacyReport.clearVotes, 0);
+    assert.equal(legacyReport.clearedByMe, false);
+    assert.equal(legacyReport.resolvedAt, null);
+    const clear = await restored.post("/api/reports/legacy-active/clear", {});
+    assert.equal(clear.status, 200);
+    const { report: cleared } = await clear.json();
+    assert.equal(cleared.clearVotes, 1);
+    assert.equal(cleared.confirmations, 0);
+    assert.equal(cleared.clearedByMe, true);
+    assert.equal(cleared.expiresAt, legacyReport.expiresAt);
+    for (const action of ["clear", "confirm"]) {
+      const expired = await restored.post(`/api/reports/legacy-expired/${action}`, {});
+      assert.equal(expired.status, 410);
+      await expired.json();
+    }
+    const replacement = await restored.post("/api/reports", { ...validReport, latitude: validReport.latitude + 3 });
+    assert.equal(replacement.status, 201, "expired persisted reports must not block creation");
+    await replacement.json();
+    await instance.stop();
+    instance = await startWorker(directory, port);
+    restored = browser(instance.base, cookie);
+    const retry = await restored.post("/api/reports/legacy-active/clear", {});
+    assert.equal(retry.status, 200);
+    assert.equal(retry.headers.get("set-cookie"), null);
+    assert.deepEqual((await retry.json()).report, cleared, "clear votes and browser identity must persist across restarts");
+    for (const voter of [browser(instance.base), browser(instance.base)]) {
+      const response = await voter.post("/api/reports/legacy-active/clear", {});
+      assert.equal(response.status, 200);
+      await response.json();
+    }
+    await instance.stop();
+    instance = await startWorker(directory, port);
+    restored = browser(instance.base, cookie);
+    const terminal = await restored.post("/api/reports/legacy-active/clear");
+    assert.equal(terminal.status, 200);
+    const resolved = (await terminal.json()).report;
+    assert.equal(resolved.clearVotes, 3);
+    assert(resolved.resolvedAt);
+    const revival = await restored.post("/api/reports/legacy-active/confirm", {});
+    assert.equal(revival.status, 410);
+    await revival.json();
+    const newReport = await restored.post("/api/reports", validReport);
+    assert.equal(newReport.status, 201, "resolution must remain terminal after restart and stop blocking new reports");
+    await newReport.json();
+  } finally {
     await instance?.stop();
     await rm(directory, { recursive: true, force: true });
   }

@@ -14,6 +14,11 @@ import { DatabaseSync } from "node:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
+import {
+  CLEAR_VOTE_THRESHOLD,
+  DUPLICATE_RADIUS_METERS,
+  distanceMeters,
+} from "../shared/reportRules.js";
 
 export const REPORT_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const COOKIE_NAME = "passo_session";
@@ -37,6 +42,9 @@ export interface RoadReport {
   expiresAt: string;
   confirmations: number;
   confirmedByMe: boolean;
+  clearVotes: number;
+  clearedByMe: boolean;
+  resolvedAt: string | null;
   source: "community" | "demo";
 }
 
@@ -54,6 +62,9 @@ interface ReportRow {
   source: RoadReport["source"];
   confirmations: number;
   confirmed_by_me: number;
+  clear_votes: number;
+  cleared_by_me: number;
+  resolved_at: string | null;
 }
 
 export interface AppOptions {
@@ -72,6 +83,7 @@ const reportSchema = z
     location: z.string().trim().min(3).max(140),
     description: z.string().trim().max(500).optional().default(""),
     severity: z.enum(["attention", "danger"]),
+    allowDuplicate: z.boolean().optional().default(false),
   })
   .strict();
 
@@ -98,6 +110,7 @@ export function createApp(options: AppOptions = {}) {
       severity TEXT NOT NULL CHECK (severity IN ('attention','danger')),
       created_at TEXT NOT NULL,
       expires_at TEXT NOT NULL,
+      resolved_at TEXT,
       initial_confirmations INTEGER NOT NULL DEFAULT 0,
       source TEXT NOT NULL CHECK (source IN ('community','demo'))
     );
@@ -107,8 +120,20 @@ export function createApp(options: AppOptions = {}) {
       created_at TEXT NOT NULL,
       PRIMARY KEY (report_id, participant_id)
     );
+    CREATE TABLE IF NOT EXISTS clear_votes (
+      report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+      participant_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (report_id, participant_id)
+    );
     CREATE INDEX IF NOT EXISTS reports_expiry ON reports(expires_at);
   `);
+  const reportColumns = db.prepare("PRAGMA table_info(reports)").all() as { name: string }[];
+  if (!reportColumns.some(column => column.name === "resolved_at")) {
+    db.exec("ALTER TABLE reports ADD COLUMN resolved_at TEXT");
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS reports_duplicate_lookup
+    ON reports(category, latitude, expires_at) WHERE resolved_at IS NULL AND source = 'community'`);
   let signingKey = (
     db
       .prepare("SELECT value FROM metadata WHERE key = ?")
@@ -233,16 +258,19 @@ export function createApp(options: AppOptions = {}) {
 
   const reportSelection = `
     SELECT r.*, r.initial_confirmations + (SELECT COUNT(*) FROM confirmations c WHERE c.report_id = r.id) AS confirmations,
-      EXISTS(SELECT 1 FROM confirmations c WHERE c.report_id = r.id AND c.participant_id = ?) AS confirmed_by_me
+      EXISTS(SELECT 1 FROM confirmations c WHERE c.report_id = r.id AND c.participant_id = ?) AS confirmed_by_me,
+      (SELECT COUNT(*) FROM clear_votes v WHERE v.report_id = r.id) AS clear_votes,
+      EXISTS(SELECT 1 FROM clear_votes v WHERE v.report_id = r.id AND v.participant_id = ?) AS cleared_by_me
     FROM reports r`;
   const activeReports = db.prepare(
-    `${reportSelection} WHERE r.expires_at > ? ORDER BY r.created_at DESC, r.id DESC LIMIT 500`,
+    `${reportSelection} WHERE r.expires_at > ? AND r.resolved_at IS NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 500`,
   );
-  const activeReportById = db.prepare(
-    `${reportSelection} WHERE r.id = ? AND r.expires_at > ?`,
+  const reportById = db.prepare(
+    `${reportSelection} WHERE r.id = ?`,
   );
-  const findReport = db.prepare(
-    "SELECT id, expires_at FROM reports WHERE id = ?",
+  const duplicateCandidates = db.prepare(
+    `${reportSelection} WHERE r.category = ? AND r.latitude BETWEEN ? AND ?
+      AND r.expires_at > ? AND r.resolved_at IS NULL AND r.source = 'community'`,
   );
   const confirmReport = db.prepare(
     "INSERT OR IGNORE INTO confirmations (report_id, participant_id, created_at) VALUES (?, ?, ?)",
@@ -261,12 +289,16 @@ export function createApp(options: AppOptions = {}) {
       expiresAt: row.expires_at,
       confirmations: row.confirmations,
       confirmedByMe: Boolean(row.confirmed_by_me),
+      clearVotes: row.clear_votes,
+      clearedByMe: Boolean(row.cleared_by_me),
+      resolvedAt: row.resolved_at,
       source: row.source,
     };
   }
   function reportsFor(participantId: string): RoadReport[] {
     return (
       activeReports.all(
+        participantId,
         participantId,
         new Date(now()).toISOString(),
       ) as unknown as ReportRow[]
@@ -276,12 +308,59 @@ export function createApp(options: AppOptions = {}) {
     id: string,
     participantId: string,
   ): RoadReport | undefined {
-    const row = activeReportById.get(
+    const row = reportById.get(
+      participantId,
       participantId,
       id,
-      new Date(now()).toISOString(),
     ) as unknown as ReportRow | undefined;
     return row ? toReport(row) : undefined;
+  }
+
+  function nearbyDuplicates(data: z.infer<typeof reportSchema>, participantId: string, timestamp: string): RoadReport[] {
+    // This conservative latitude band is indexed and remains correct at the
+    // poles and date line; Haversine performs the exact circular check.
+    const latitudeMargin = DUPLICATE_RADIUS_METERS / 110_000;
+    const candidates = duplicateCandidates.all(participantId, participantId, data.category,
+      Math.max(-90, data.latitude - latitudeMargin), Math.min(90, data.latitude + latitudeMargin), timestamp) as unknown as ReportRow[];
+    return candidates.map(row => ({ row, distance: distanceMeters(data.latitude, data.longitude, row.latitude, row.longitude) }))
+      .filter(candidate => candidate.distance <= DUPLICATE_RADIUS_METERS)
+      .sort((a, b) => a.distance - b.distance || a.row.id.localeCompare(b.row.id))
+      .slice(0, 3).map(candidate => toReport(candidate.row));
+  }
+
+  function feedback(id: string, participantId: string, action: "confirm" | "clear") {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = reportFor(id, participantId);
+      let outcome: { status: number; report?: RoadReport; error?: string };
+      if (!existing) outcome = { status: 404, error: "Segnalazione non trovata." };
+      else if (Date.parse(existing.expiresAt) <= now()) {
+        outcome = { status: 410, error: "Questa segnalazione è scaduta. Puoi crearne una nuova." };
+      } else if (existing.resolvedAt) {
+        outcome = action === "clear" && existing.clearedByMe
+          ? { status: 200, report: existing }
+          : { status: 410, error: "Questa segnalazione è già stata rimossa dalla mappa." };
+      } else {
+        const timestamp = new Date(now()).toISOString();
+        if (action === "confirm") {
+          db.prepare("DELETE FROM clear_votes WHERE report_id = ? AND participant_id = ?").run(id, participantId);
+          confirmReport.run(id, participantId, timestamp);
+        } else {
+          db.prepare("DELETE FROM confirmations WHERE report_id = ? AND participant_id = ?").run(id, participantId);
+          db.prepare("INSERT OR IGNORE INTO clear_votes (report_id, participant_id, created_at) VALUES (?, ?, ?)").run(id, participantId, timestamp);
+          const count = db.prepare("SELECT COUNT(*) AS count FROM clear_votes WHERE report_id = ?").get(id) as { count: number };
+          if (count.count >= CLEAR_VOTE_THRESHOLD) {
+            db.prepare("UPDATE reports SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL").run(timestamp, id);
+          }
+        }
+        outcome = { status: 200, report: reportFor(id, participantId) };
+      }
+      db.exec("COMMIT");
+      return outcome;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   const app = express();
@@ -412,51 +491,38 @@ export function createApp(options: AppOptions = {}) {
     const id = randomUUID();
     const createdAt = now();
     const data = result.data;
-    insertReport.run(
-      id,
-      data.category,
-      data.latitude,
-      data.longitude,
-      data.location,
-      data.description,
-      data.severity,
-      new Date(createdAt).toISOString(),
-      new Date(createdAt + REPORT_LIFETIME_MS).toISOString(),
-      0,
-      "community",
-    );
-    const report = reportFor(id, res.locals.participantId);
+    let report: RoadReport | undefined;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const duplicates = data.allowDuplicate ? [] : nearbyDuplicates(data, res.locals.participantId, new Date(createdAt).toISOString());
+      if (duplicates.length) {
+        db.exec("COMMIT");
+        res.status(409).json({ error: "C'è già una segnalazione simile nelle vicinanze.", code: "POSSIBLE_DUPLICATE", duplicates });
+        return;
+      }
+      insertReport.run(
+        id, data.category, data.latitude, data.longitude, data.location, data.description, data.severity,
+        new Date(createdAt).toISOString(), new Date(createdAt + REPORT_LIFETIME_MS).toISOString(), 0, "community",
+      );
+      report = reportFor(id, res.locals.participantId);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
     res.status(201).json({ report });
     broadcast();
   });
-  app.post(
-    "/api/reports/:id/confirm",
-    rateLimit("confirm", 100),
-    (req, res) => {
-      const row = findReport.get(String(req.params.id)) as
-        { id: string; expires_at: string } | undefined;
-      if (!row) {
-        res.status(404).json({ error: "Segnalazione non trovata." });
-        return;
-      }
-      if (Date.parse(row.expires_at) <= now()) {
-        res
-          .status(410)
-          .json({
-            error: "Questa segnalazione è scaduta. Puoi crearne una nuova.",
-          });
-        return;
-      }
-      confirmReport.run(
-        row.id,
-        res.locals.participantId,
-        new Date(now()).toISOString(),
-      );
-      const report = reportFor(row.id, res.locals.participantId);
-      res.json({ report });
-      broadcast();
-    },
-  );
+  function feedbackHandler(action: "confirm" | "clear") {
+    return (req: Request, res: Response) => {
+      const outcome = feedback(String(req.params.id), res.locals.participantId, action);
+      res.status(outcome.status).json(outcome.report ? { report: outcome.report } : { error: outcome.error });
+      if (outcome.status === 200) broadcast();
+    };
+  }
+  const feedbackRateLimit = rateLimit("feedback", 100);
+  app.post("/api/reports/:id/confirm", feedbackRateLimit, feedbackHandler("confirm"));
+  app.post("/api/reports/:id/clear", feedbackRateLimit, feedbackHandler("clear"));
   app.get("/api/events", (_req, res) => {
     const participantId = String(res.locals.participantId);
     if (
