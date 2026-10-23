@@ -11,7 +11,7 @@
     "dev:cloud": "wrangler dev --ip 0.0.0.0 --port 8787",
     "deploy": "wrangler deploy",
     "build": "npm run typecheck && vite build",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p worker/tsconfig.json",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p worker/tsconfig.json && tsc --noEmit -p functions/tsconfig.json",
     "start": "tsx server/index.ts",
     "test": "tsx --test tests/*.test.ts"
   },

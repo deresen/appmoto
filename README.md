@@ -30,7 +30,7 @@ L'API `GET /api/reports/:id` recupera anche un punto attivo fuori dal limite di 
 
 Sono previsti due banner in pagina, contrassegnati **Pubblicità**, separati dalla mappa e dalle azioni sulle segnalazioni. La rete AdSense seleziona gli annunci per le unità display configurate. La funzione Google **Auto ads**, che decide autonomamente posizioni aggiuntive, va lasciata disattivata nel dashboard per mantenere soltanto questi due spazi.
 
-La configurazione pubblica è `public/ads-config.json`. Contiene soltanto identificatori destinati alla pagina: nessuna password o chiave privata. Il publisher già inserito permette alla build di generare il meta `google-adsense-account` e `/ads.txt` per la verifica del sito, **anche con `enabled: false`**. Questo non attiva annunci né carica script pubblicitari. L'approvazione viene decisa da Google: l'app non ne verifica automaticamente lo stato e non garantisce l'idoneità dell'attuale sottodominio `workers.dev`.
+La configurazione pubblica è `public/ads-config.json`. Contiene soltanto identificatori destinati alla pagina: nessuna password o chiave privata. Il publisher già inserito permette alla build di generare il meta `google-adsense-account` e `/ads.txt` per la verifica del sito, **anche con `enabled: false`**. Questo non attiva annunci né carica script pubblicitari. L'approvazione viene decisa da Google: l'app non ne verifica automaticamente lo stato. AdSense ha rifiutato l'indirizzo `appmoto.angellotti-gius.workers.dev` perché richiede un dominio di primo livello valido; l'indirizzo suggerito `angellotti-gius.workers.dev` non ospita l'app. Il percorso Pages descritto sotto fornisce un indirizzo con un solo nome davanti a `pages.dev`; accettazione e approvazione restano da verificare con Google.
 
 Per attivare gli annunci dopo l'approvazione:
 
@@ -79,6 +79,23 @@ Una versione precedente è stata pubblicata su **https://appmoto.angellotti-gius
 4. Apri l'URL HTTPS `workers.dev` assegnato. Verifica la mappa, pubblica una segnalazione e confermala da una seconda sessione con cookie separati. Controlla gli aggiornamenti senza ricaricare e la permanenza del dato dopo una nuova visita o distribuzione.
 
 In alternativa, dalla propria macchina si può eseguire `npx wrangler login` e poi `npm run deploy`. Il login avviene nel browser con il proprio account. Non serve un servizio realtime separato né una sua chiave API.
+
+### Indirizzo gratuito con Cloudflare Pages
+
+Per ottenere un indirizzo `nome-progetto.pages.dev`, crea un progetto **Pages** nello stesso account Cloudflare. Il frontend e i file di verifica AdSense vengono pubblicati su Pages; le richieste `/api/*` passano attraverso un **service binding** al Worker `appmoto` esistente. Il database SQLite e le segnalazioni restano nel suo Durable Object: **mantieni attivo il Worker `appmoto`**. Questa configurazione non attiva prodotti a pagamento; usa Pages e Workers sul piano Free, entro le rispettive quote.
+
+1. Nel dashboard **Workers & Pages** avvia la creazione di un progetto **Pages** collegato a GitHub. I nomi delle voci possono variare: scegli Pages e l'importazione del repository, quindi `deresen/appmoto` e il ramo di produzione `main`.
+2. Scegli un nome disponibile, per esempio `passo-appmoto`. L'indirizzo effettivo sarà `https://<nome-scelto>.pages.dev`; il nome nell'esempio non è prenotato.
+3. Imposta framework **Vite**, comando di build **`npm run build`**, cartella di output **`dist`** e directory principale del repository **`/`**. Usa Node.js **24**; se la versione non viene rilevata da `package.json`, aggiungi la variabile di build `NODE_VERSION=24`. Per questo progetto Pages usa queste impostazioni di build; il comando `npm run deploy` è quello del Worker esistente.
+4. Nel progetto Pages apri le impostazioni dei **binding** dell'ambiente **Produzione** e aggiungi un **Service binding**: nome della variabile **`APPMOTO_API`**, servizio Worker **`appmoto`**. Se l'impostazione è disponibile soltanto dopo la prima pubblicazione, completa quella pubblicazione, aggiungi il binding e avvia una **nuova distribuzione di produzione** perché abbia effetto.
+5. Lascia il binding assente nell'ambiente **Preview**: in quel caso le API rispondono `503`, così le anteprime non scrivono nel database di produzione. Per verificare l'app completa usa l'indirizzo di produzione `https://<nome-scelto>.pages.dev`.
+6. Sul nuovo indirizzo controlla `/api/health`: deve rispondere con `status: "ok"`, `storage: "sqlite"` e `realtime: "websocket"`. Controlla `/ads.txt`, poi crea una segnalazione e verifica che compaia nell'altra sessione e anche sull'indirizzo precedente senza ricaricare. Solo dopo questi controlli aggiungi **l'indirizzo Pages effettivamente assegnato** in AdSense e ripeti la verifica/richiesta di revisione.
+
+`wrangler.jsonc` resta la configurazione del Worker esistente. Per Pages, la cartella di output e i binding si impostano nel dashboard; la cartella `functions/` nella radice del repository viene compilata da Pages durante la pubblicazione.
+
+I cookie sono separati per indirizzo: visitando l'app su Pages viene creata una nuova sessione anonima, quindi i propri voti sul vecchio hostname non risultano come voti dello stesso browser sul nuovo. Le segnalazioni e i conteggi complessivi restano condivisi nel database attuale. I nuovi link di condivisione usano l'indirizzo da cui si apre l'app; quelli già condivisi sul vecchio indirizzo continuano a funzionare finché quel Worker è attivo.
+
+Il codice è predisposto per Pages, ma creare il progetto e collegare il servizio nel proprio account resta necessario: un commit non crea il nuovo indirizzo da solo. Un indirizzo della forma `nome-progetto.pages.dev` evita il livello aggiuntivo di sottodominio segnalato nell'errore AdSense; non garantisce l'accettazione del sito o l'approvazione degli annunci. Non occorre acquistare un dominio per provare questo percorso.
 
 ### Quote del piano Free
 
