@@ -1,0 +1,20 @@
+{
+  "id": "/",
+  "name": "Passo — La strada, insieme",
+  "short_name": "Passo",
+  "description": "Segnalazioni della community sulle condizioni delle strade, pensate per chi viaggia in moto e utili a tutti.",
+  "lang": "it",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#faf9f6",
+  "theme_color": "#ea580c",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

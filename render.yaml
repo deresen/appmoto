@@ -1,0 +1,30 @@
+# Questa configurazione crea un servizio e un disco A PAGAMENTO su Render.
+# L'applicazione della Blueprint richiede la revisione e conferma nell'account Render.
+services:
+  - type: web
+    name: passo
+    runtime: node
+    repo: https://github.com/deresen/appmoto
+    branch: main
+    region: frankfurt
+    plan: starter
+    numInstances: 1
+    autoDeploy: false
+    buildCommand: npm ci --include=dev && npm run build && npm prune --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+      - key: SEED_DEMO
+        value: "0"
+      - key: TRUST_PROXY
+        value: "1"
+    disk:
+      name: passo-data
+      mountPath: /var/data
+      sizeGB: 1
