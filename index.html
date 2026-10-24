@@ -14,10 +14,26 @@
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icon.svg" />
+    <link rel="stylesheet" href="/src/publisher.css" />
     <title>Passo — La strada, insieme.</title>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <main class="initial-content">
+        <header class="initial-header">
+          <a href="/" class="initial-brand">passo.</a>
+          <nav aria-label="Navigazione principale">
+            <a href="/guide/">Guide</a>
+            <a href="/progetto/">Il progetto</a>
+            <a href="/privacy/">Privacy</a>
+          </nav>
+        </header>
+        <h1>Passo: capire e condividere le condizioni della strada</h1>
+        <p>Una mappa collaborativa pensata per i motociclisti e utile a chiunque viaggi. Le segnalazioni sono osservazioni della community: non certificano le condizioni della strada e non sostituiscono la segnaletica.</p>
+        <!--passo-publisher-introduction-->
+        <noscript><p>Per usare la mappa e inviare segnalazioni occorre JavaScript. Le guide, le informazioni sul progetto e la privacy sono consultabili anche senza JavaScript.</p></noscript>
+      </main>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

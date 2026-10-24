@@ -40,7 +40,7 @@ import {
   X,
 } from "lucide-react";
 import MapView from "./MapView";
-import AdBanner, { AdvertisingPreferencesButton } from "./AdBanner";
+import PublisherIntroduction from "./PublisherIntroduction";
 import ReportShare from "./ReportShare";
 import { readReportLink } from "./reportSharing";
 import type { Category, NewReport, Report, ReportFocusStatus, ReportsSnapshot, Severity } from "./types";
@@ -971,6 +971,7 @@ export default function App() {
           <button onClick={() => openInfo("about")}>
             Come funziona <ArrowUpRight size={14} />
           </button>
+          <a href="/guide/">Guide <ArrowUpRight size={14} /></a>
         </nav>
         <div className="header-right">
           <span className="header-community">
@@ -1416,8 +1417,6 @@ export default function App() {
           </div>
         </section>
 
-        <AdBanner placement="afterMap" />
-
         <section className="how-strip" aria-label="Come contribuire">
           <div className="how-heading">
             <span className="eyebrow">POCHI SECONDI. UN AIUTO CONCRETO.</span>
@@ -1455,7 +1454,7 @@ export default function App() {
             </p>
           </div>
         </section>
-        <AdBanner placement="footer" />
+        <PublisherIntroduction />
       </main>
 
       <footer className="site-footer">
@@ -1468,7 +1467,9 @@ export default function App() {
           <button onClick={() => openInfo("privacy")}>
             Privacy e posizione
           </button>
-          <AdvertisingPreferencesButton />
+          <a href="/guide/">Guide</a>
+          <a href="/progetto/">Il progetto</a>
+          <a href="/privacy/">Informativa privacy</a>
           <span className="footer-beta">PRIMA VERSIONE</span>
         </div>
       </footer>
@@ -1881,13 +1882,13 @@ export default function App() {
             </p>
             <h3>Pubblicità</h3>
             <p>
-              Il sito carica lo script Google AdSense all’apertura per il
-              collegamento al servizio pubblicitario. I due banner dell’app
-              sono separati dalle segnalazioni e richiedono la configurazione
-              del servizio e il consenso alla pubblicità. Quando il servizio è
-              attivo, puoi rivedere la scelta da
-              “Preferenze pubblicità” in fondo alla pagina.
+              La mappa, i moduli e gli avvisi non mostrano pubblicità e non
+              caricano lo script AdSense. I codici pubblici di verifica del
+              sito non installano cookie Google. Un’eventuale attivazione
+              degli annunci sulle guide richiederà una configurazione distinta
+              e la gestione del consenso.
             </p>
+            <a href="/privacy/">Leggi l’informativa completa <ArrowUpRight size={14} /></a>
             <a href="https://policies.google.com/privacy?hl=it" target="_blank" rel="noreferrer">
               Informativa sulla privacy di Google <ArrowUpRight size={14} />
             </a>
@@ -1899,9 +1900,10 @@ export default function App() {
               Privacy di OpenStreetMap <ArrowUpRight size={15} />
             </a>
             <p className="privacy-prototype">
-              Questa è una prima versione dimostrativa: prima dell’uso pubblico
-              serviranno gestione degli abusi, account e una politica completa
-              su conservazione ed eliminazione dei dati.
+              Il servizio usa contributi anonimi e non prevede un account
+              personale. Non dispone di una moderazione completa. La scadenza
+              di un punto non coincide con la cancellazione immediata del
+              relativo record: l’informativa completa descrive questi limiti.
             </p>
           </div>
         </Dialog>

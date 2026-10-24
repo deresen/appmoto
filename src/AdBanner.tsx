@@ -1,6 +1,6 @@
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import { Info } from "lucide-react";
-import type { AdPlacement } from "../shared/advertising";
+import { isPublisherArticlePath, type AdPlacement } from "../shared/advertising";
 import {
   getAdvertisingState,
   initializeAdvertising,
@@ -24,6 +24,7 @@ function AdvertisingUnit({ placement }: { placement: AdPlacement }) {
 export default function AdBanner({ placement }: { placement: AdPlacement }) {
   const state = useSyncExternalStore(subscribeAdvertising, getAdvertisingState, getAdvertisingState);
   useEffect(() => { void initializeAdvertising(); }, []);
+  if (!isPublisherArticlePath(window.location.pathname)) return null;
   const active = state.status === "consented" && Boolean(state.config.slots[placement]);
   return <aside className={`advertising-banner ${active ? "advertising-banner--active" : ""}`}
     aria-label="Spazio pubblicitario" data-ad-placement={placement}>

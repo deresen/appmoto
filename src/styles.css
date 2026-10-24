@@ -144,7 +144,8 @@ p {
   gap: 29px;
   margin-left: 22px;
 }
-.header-nav button {
+.header-nav button,
+.header-nav > a {
   font-size: 12px;
   font-weight: 650;
   height: 100%;
@@ -1146,10 +1147,15 @@ main {
 }
 .site-footer > div:last-child {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 22px;
 }
-.site-footer button {
+.site-footer button,
+.site-footer a {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
   font-size: 9px;
   padding: 5px 0;
 }
@@ -1854,7 +1860,8 @@ main {
   .header-nav {
     gap: 20px;
   }
-  .header-nav button {
+  .header-nav button,
+  .header-nav > a {
     font-size: 10px;
   }
   .header-report {
@@ -2372,10 +2379,11 @@ main {
     padding: 19px 18px;
   }
   .site-footer > div:last-child {
-    gap: 0;
+    gap: 6px 14px;
   }
-  .site-footer button {
-    font-size: 8px;
+  .site-footer button,
+  .site-footer a {
+    font-size: 11px;
   }
   .footer-beta {
     display: none;

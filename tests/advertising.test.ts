@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { build } from "vite";
 import {
@@ -11,9 +11,10 @@ import {
   normalizePublisherId,
   parseAdvertisingConfig,
 } from "../shared/advertising.js";
-import { advertisingOwnershipPlugin } from "../vite.config.js";
+import { advertisingOwnershipPlugin, isPublisherArticlePath } from "../vite.config.js";
 
 const publisherId = "pub-1234567890123456";
+const articlePath = "/guide/segnalare-un-pericolo/index.html";
 const configured = {
   enabled: true, publisherId,
   slots: { afterMap: "1234567890", footer: "2345678901" },
@@ -83,20 +84,45 @@ test("ownership verification is independent from serving ads and rejects malform
   }
 });
 
-async function buildAdvertisingFixture(configuration: unknown) {
+test("publisher content eligibility excludes app actions, navigation, legal and error pages", () => {
+  assert.equal(isPublisherArticlePath("/guide/segnalare-un-pericolo/"), true);
+  assert.equal(isPublisherArticlePath(articlePath), true);
+  assert.equal(isPublisherArticlePath("/guide/leggere-la-mappa/"), true);
+  assert.equal(isPublisherArticlePath("/guide/leggere-la-mappa/index.html"), true);
+  assert.equal(isPublisherArticlePath("/guide/fondo-stradale/"), true);
+  assert.equal(isPublisherArticlePath("/guide/fondo-stradale/index.html"), true);
+  for (const path of [
+    "/", "/index.html", "/?segnalazione=report-123", "/?azione=segnala",
+    "/mappa/", "/mappa/index.html", "/segnala/", "/segnala/index.html",
+    "/guide/", "/guide/index.html", "/progetto/", "/progetto/index.html",
+    "/privacy/", "/privacy/index.html", "/404.html", "/404/",
+    "/guide/nuovo-articolo/index.html", "/guide/segnalare-un-pericolo-extra/index.html",
+    "/guide/segnalare-un-pericolo/modulo/", "/guide/segnalare-un-pericolo/../../index.html",
+  ]) assert.equal(isPublisherArticlePath(path), false, `${path} must not be treated as publisher content`);
+});
+
+async function buildAdvertisingFixture(configuration: unknown, paths = ["/index.html"]) {
   const directory = await mkdtemp(join(tmpdir(), "passo-advertising-build-"));
   try {
-    await writeFile(join(directory, "index.html"), "<!doctype html><html><head><title>Passo</title></head><body>Passo</body></html>");
+    const inputFiles = await Promise.all(paths.map(async path => {
+      const filename = join(directory, path.replace(/^\//, ""));
+      await mkdir(dirname(filename), { recursive: true });
+      await writeFile(filename, "<!doctype html><html><head><title>Passo</title></head><body>Passo</body></html>");
+      return filename;
+    }));
     const result = await build({
       configFile: false, root: directory, logLevel: "silent",
       plugins: [advertisingOwnershipPlugin(() => configuration)],
-      build: { write: false },
+      build: { write: false, rollupOptions: { input: inputFiles } },
     });
     const outputs = (Array.isArray(result) ? result : [result]).flatMap(bundle => "output" in bundle ? bundle.output : []);
-    const index = outputs.find(asset => asset.type === "asset" && asset.fileName === "index.html");
+    const pages: Record<string, string> = {};
+    for (const asset of outputs) {
+      if (asset.type === "asset" && asset.fileName.endsWith(".html")) pages[`/${asset.fileName}`] = String(asset.source);
+    }
+    for (const path of paths) assert(pages[path], `the production build must emit ${path}`);
     const ads = outputs.find(asset => asset.type === "asset" && asset.fileName === "ads.txt");
-    assert(index?.type === "asset");
-    return { html: String(index.source), adsTxt: ads?.type === "asset" ? String(ads.source) : undefined };
+    return { html: pages[paths[0]], pages, adsTxt: ads?.type === "asset" ? String(ads.source) : undefined };
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
@@ -113,19 +139,21 @@ function attributes(tag: string): Record<string, string> {
   return values;
 }
 
-test("a production build keeps verification and ads.txt without loading the SDK when the head option is absent or false", async () => {
+test("a production build keeps verification on app and article pages without the SDK when the head option is absent or false", async () => {
   for (const extra of [{}, { loadScriptInHead: false }]) {
-    const { html, adsTxt } = await buildAdvertisingFixture({ ...configured, enabled: false, ...extra });
-    assert.match(html, /name="google-adsense-account"/);
-    assert(html.includes(`content="ca-${publisherId}"`));
-    assert.equal(scriptTags(html).length, 0);
-    assert.doesNotMatch(html, /googlesyndication|fundingchoices/);
+    const { pages, adsTxt } = await buildAdvertisingFixture({ ...configured, enabled: false, ...extra }, ["/index.html", articlePath]);
+    for (const html of Object.values(pages)) {
+      assert.match(html, /name="google-adsense-account"/);
+      assert(html.includes(`content="ca-${publisherId}"`));
+      assert.equal(scriptTags(html).length, 0);
+      assert.doesNotMatch(html, /googlesyndication|fundingchoices/);
+    }
     assert.equal(adsTxt, `google.com, ${publisherId}, DIRECT, f08c47fec0942fa0\n`);
   }
 });
 
-test("the requested production head contains exactly one canonical AdSense script with reliable load and error markers", async () => {
-  const { html, adsTxt } = await buildAdvertisingFixture({ ...configured, enabled: false, loadScriptInHead: true });
+test("an eligible article's production head contains one canonical AdSense script with reliable load and error markers", async () => {
+  const { html, adsTxt } = await buildAdvertisingFixture({ ...configured, enabled: false, loadScriptInHead: true }, [articlePath]);
   const head = /<head\b[^>]*>([\s\S]*?)<\/head>/i.exec(html)?.[1];
   assert(head, "the script belongs inside the generated HTML head");
   const headScripts = scriptTags(head);
@@ -148,9 +176,28 @@ test("the requested production head contains exactly one canonical AdSense scrip
   assert.equal(adsTxt, `google.com, ${publisherId}, DIRECT, f08c47fec0942fa0\n`);
 });
 
+test("even with head loading requested, a multi-page build serves the SDK only on real article paths", async () => {
+  const paths = [
+    "/index.html", "/guide/index.html", "/mappa/index.html", "/segnala/index.html",
+    "/progetto/index.html", "/privacy/index.html", "/404.html",
+    articlePath, "/guide/leggere-la-mappa/index.html", "/guide/fondo-stradale/index.html",
+  ];
+  const { pages, adsTxt } = await buildAdvertisingFixture({ ...configured, enabled: false, loadScriptInHead: true }, paths);
+  for (const [path, html] of Object.entries(pages)) {
+    const scripts = scriptTags(html);
+    const isArticle = path === articlePath || path === "/guide/leggere-la-mappa/index.html" || path === "/guide/fondo-stradale/index.html";
+    assert.equal(scripts.length, isArticle ? 1 : 0, `${path} must enforce its own publisher-content eligibility`);
+    if (!isArticle) assert.doesNotMatch(html, /googlesyndication|fundingchoices/);
+    assert.match(html, /name="google-adsense-account"/, `verification remains available on ${path}`);
+  }
+  assert.equal(adsTxt, `google.com, ${publisherId}, DIRECT, f08c47fec0942fa0\n`);
+});
+
 test("an invalid publisher never produces a Google SDK tag, verification meta or ads.txt even when requested", async () => {
-  const { html, adsTxt } = await buildAdvertisingFixture({ ...configured, publisherId: "pub-invalid", loadScriptInHead: true });
-  assert.equal(scriptTags(html).length, 0);
-  assert.doesNotMatch(html, /google-adsense-account|googlesyndication|fundingchoices/);
+  const { pages, adsTxt } = await buildAdvertisingFixture({ ...configured, publisherId: "pub-invalid", loadScriptInHead: true }, ["/index.html", articlePath]);
+  for (const html of Object.values(pages)) {
+    assert.equal(scriptTags(html).length, 0);
+    assert.doesNotMatch(html, /google-adsense-account|googlesyndication|fundingchoices/);
+  }
   assert.equal(adsTxt, undefined);
 });

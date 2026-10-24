@@ -1,0 +1,56 @@
+@import "@fontsource-variable/manrope";
+:root { font-family: "Manrope Variable", system-ui, sans-serif; color: #252923; background: #fafbf8; font-synthesis: none; -webkit-font-smoothing: antialiased; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+a { color: #305440; text-underline-offset: 4px; }
+a:hover { color: #ad3f16; }
+a:focus-visible { outline: 2px solid #e75b27; outline-offset: 4px; }
+.content-skip { position: fixed; left: 20px; top: -80px; z-index: 100; padding: 12px 18px; background: #fff; border: 2px solid #e75b27; }
+.content-skip:focus { top: 12px; }
+.content-header { padding: 20px max(22px, calc((100vw - 1100px) / 2)); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 30px; border-bottom: 1px solid #e3e7de; background: #fff; }
+.content-header .brand { font-size: 33px; font-weight: 850; letter-spacing: -2px; color: #304c3c; text-decoration: none; }
+.content-header nav, .content-footer nav { display: flex; flex-wrap: wrap; gap: 5px 24px; }
+.content-header nav a, .content-footer nav a { display: inline-flex; align-items: center; min-height: 44px; font-size: 13px; font-weight: 650; text-decoration: none; }
+.content-header nav a[aria-current="page"] { color: #ad3f16; text-decoration: underline; }
+.content-main { width: min(100%, 1100px); margin: auto; padding: 35px 22px 70px; }
+.content-article { max-width: 800px; margin: 0 auto; }
+.breadcrumbs { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; line-height: 1.8; margin-bottom: 35px; color: #62695e; }
+.breadcrumbs a { min-height: 30px; }
+.eyebrow { font-size: 10px; color: #816d58; font-weight: 800; letter-spacing: 1.6px; text-transform: uppercase; }
+h1 { font-size: clamp(30px, 5vw, 48px); line-height: 1.17; letter-spacing: -1.7px; margin: 14px 0 23px; overflow-wrap: break-word; }
+h2 { font-size: clamp(22px, 3vw, 29px); line-height: 1.3; letter-spacing: -.7px; margin: 36px 0 16px; }
+h3 { font-size: 19px; line-height: 1.5; margin: 24px 0 12px; }
+p, li, dd { font-size: 15px; line-height: 1.95; color: #4d5849; }
+p { margin: 0 0 18px; }
+ul, ol { padding-left: 24px; margin: 15px 0 24px; }
+li + li { margin-top: 10px; }
+.content-lead { font-size: 18px; line-height: 1.8; color: #505d49; margin-bottom: 25px; }
+.content-meta, .byline, .article-meta { font-size: 12px; line-height: 1.9; color: #737b6c; }
+.content-note { margin: 25px 0; padding: 21px 24px; border-left: 4px solid #d76b36; background: #f0f3eb; border-radius: 0 12px 12px 0; }
+.content-note p:last-child { margin-bottom: 0; }
+.content-note h2, .content-note h3 { margin-top: 0; }
+.guide-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin: 26px 0; }
+.guide-card { display: flex; flex-direction: column; padding: 24px; border: 1px solid #e3e7de; border-radius: 15px; background: #fff; }
+.guide-card h2, .guide-card h3 { font-size: 22px; margin-top: 0; }
+.guide-card a { color: #304c3c; }
+.guide-card p { font-size: 14px; }
+.guide-card > a:last-child { margin-top: auto; min-height: 44px; display: inline-flex; align-items: center; font-size: 13px; font-weight: 750; }
+.content-footer { display: flex; flex-wrap: wrap; gap: 6px 24px; padding: 28px max(22px, calc((100vw - 1100px) / 2)); border-top: 1px solid #e3e7de; background: #f1f3ed; }
+.content-footer > a { display: inline-flex; align-items: center; min-height: 44px; font-size: 13px; font-weight: 650; }
+.content-footer p { font-size: 12px; margin: 6px 0 0; }
+.content-main table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+.content-main th, .content-main td { text-align: left; padding: 13px; border: 1px solid #dfe4d8; font-size: 14px; line-height: 1.7; overflow-wrap: anywhere; }
+.content-main blockquote { margin: 20px 0; padding: 20px 24px; border-left: 3px solid #9ba88d; background: #f1f4ee; }
+.content-main blockquote p:last-child { margin-bottom: 0; }
+.content-main time { white-space: nowrap; }
+@media (max-width: 640px) {
+  .content-header { padding: 15px 20px; }
+  .content-header nav { gap: 3px 17px; }
+  .content-main { padding: 25px 20px 45px; }
+  .breadcrumbs { margin-bottom: 24px; }
+  h1 { letter-spacing: -1px; }
+  .content-lead { font-size: 17px; }
+  .guide-grid { grid-template-columns: 1fr; gap: 15px; }
+  .content-note { padding: 18px; }
+  .content-main th, .content-main td { padding: 8px; font-size: 12px; }
+}

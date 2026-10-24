@@ -2,6 +2,16 @@ export const AD_PLACEMENTS = ["afterMap", "footer"] as const;
 export type AdPlacement = (typeof AD_PLACEMENTS)[number];
 export const ADSENSE_SCRIPT_ID = "passo-google-adsense";
 
+const publisherArticles = new Set([
+  "/guide/segnalare-un-pericolo/",
+  "/guide/leggere-la-mappa/",
+  "/guide/fondo-stradale/",
+]);
+
+export function isPublisherArticlePath(path: string): boolean {
+  return publisherArticles.has(path.replace(/index\.html$/, ""));
+}
+
 export function adSenseScriptUrl(clientId: string): string {
   return `https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${clientId}`;
 }

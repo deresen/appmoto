@@ -3,6 +3,7 @@ import {
   adSenseScriptUrl,
   hasAdvertisingConsent,
   isAdvertisingConfigured,
+  isPublisherArticlePath,
   parseAdvertisingConfig,
   type AdvertisingConfig,
   type AdPlacement,
@@ -109,10 +110,12 @@ function watchGoogleChoices() {
 async function listenForConsent() {
   const deadline = Date.now() + 10000;
   while (typeof window.__tcfapi !== "function" && Date.now() < deadline) {
+    if (!isPublisherArticlePath(window.location.pathname)) return;
     await new Promise<void>(resolve => window.setTimeout(resolve, 200));
   }
   if (typeof window.__tcfapi !== "function") { update({ status: "unavailable" }); return; }
   window.__tcfapi("addEventListener", 2, (data, success) => {
+    if (!isPublisherArticlePath(window.location.pathname)) { update({ status: "inactive" }); return; }
     if (!success) { update({ status: "unavailable" }); return; }
     if (hasAdvertisingConsent(data)) update({ status: "consented" });
     else if (data?.eventStatus === "cmpuishown" || data?.cmpStatus === "loading") update({ status: "waiting" });
@@ -123,17 +126,20 @@ async function listenForConsent() {
 
 /** Initialize display units; any build-time AdSense tag loads independently. */
 export function initializeAdvertising(): Promise<void> {
+  if (!isPublisherArticlePath(window.location.pathname)) return Promise.resolve();
   if (initialization) return initialization;
   initialization = (async () => {
     try {
       const response = await fetch("/ads-config.json", { credentials: "omit", cache: "no-store" });
       if (!response.ok) return;
       const config = parseAdvertisingConfig(await response.json());
+      if (!isPublisherArticlePath(window.location.pathname)) return;
       update({ config });
       if (!isAdvertisingConfigured(config)) return;
       update({ status: "waiting" });
       watchGoogleChoices();
       await loadScript("passo-google-cmp", config.cmpScriptUrl);
+      if (!isPublisherArticlePath(window.location.pathname)) return;
       watchGoogleChoices();
       await listenForConsent();
     } catch { update({ status: "unavailable" }); }
@@ -142,12 +148,14 @@ export function initializeAdvertising(): Promise<void> {
 }
 
 export async function requestAdvertisingUnit(element: HTMLElement, placement: AdPlacement): Promise<void> {
+  if (!isPublisherArticlePath(window.location.pathname)) return;
   const { config, consentEpoch } = state;
   if (state.status !== "consented" || !isAdvertisingConfigured(config) || !config.slots[placement]
     || !element.isConnected || requestedUnits.has(element)) return;
   try {
     await loadScript(ADSENSE_SCRIPT_ID, adSenseScriptUrl(config.clientId), true);
-    if (state.status !== "consented" || state.consentEpoch !== consentEpoch
+    if (!isPublisherArticlePath(window.location.pathname)
+      || state.status !== "consented" || state.consentEpoch !== consentEpoch
       || !element.isConnected || requestedUnits.has(element)) return;
     requestedUnits.add(element);
     (window.adsbygoogle ||= [] as Array<Record<string, unknown>>).push({});

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Come Passo usa posizione, segnalazioni pubbliche, cookie tecnico e dati di connessione. Conservazione dei record e servizi esterni utilizzati." />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="stylesheet" href="/src/content.css" />
+    <title>Privacy, posizione e dati — Passo</title>
+  </head>
+  <body>
+    <a class="content-skip" href="#contenuto">Vai al contenuto</a>
+    <header class="content-header">
+      <a class="brand" href="/" aria-label="Passo, apri la mappa">passo<span class="brand-dot">.</span></a>
+      <nav aria-label="Navigazione principale">
+        <a href="/">Mappa</a><a href="/guide/">Guide</a><a href="/progetto/">Il progetto</a><a href="/privacy/" aria-current="page">Privacy</a>
+      </nav>
+    </header>
+    <main id="contenuto" class="content-main">
+      <nav class="breadcrumbs" aria-label="Percorso"><a href="/">Passo</a><span aria-hidden="true">/</span><span>Privacy e dati</span></nav>
+      <article class="content-article">
+        <p class="eyebrow">POSIZIONE E DATI</p>
+        <h1>Che cosa viene condiviso quando usi Passo.</h1>
+        <p class="content-lead">Consultare le condizioni stradali, cercare punti vicini e pubblicare una segnalazione comportano usi diversi della posizione. Questa pagina descrive il funzionamento attuale del servizio e distingue la visibilità di un punto dalla conservazione del relativo record.</p>
+        <p>A cura del progetto Passo · Aggiornato il <time datetime="2026-10-24">24 ottobre 2026</time></p>
+
+        <section aria-labelledby="posizione">
+          <h2 id="posizione">Posizione: ricerca nelle vicinanze e pubblicazione</h2>
+          <p>Passo chiede la geolocalizzazione quando premi un comando che la utilizza, come «Vicino a me», «Aggiorna posizione» o «La mia posizione». L'autorizzazione è gestita dal browser e può essere rifiutata o revocata dalle sue impostazioni. Non viene avviato un tracciamento continuo degli spostamenti.</p>
+          <p>Per «Vicino a me», il browser calcola distanze e filtro entro 5, 10 o 25 chilometri sulle segnalazioni già caricate. Le coordinate usate per questo filtro non vengono inviate al server dell'app per la ricerca. La posizione non si aggiorna mentre ti muovi: serve una nuova azione esplicita.</p>
+          <p>Quando pubblichi una segnalazione, invece, invii al servizio il punto scelto sulla mappa. Quel punto diventa pubblico insieme alla categoria, al nome del luogo, alla descrizione eventualmente inserita, al livello di attenzione, agli orari e ai conteggi dei voti. Il punto scelto può essere diverso dalla tua posizione corrente.</p>
+          <aside class="content-note"><p><strong>Pubblica solo informazioni stradali.</strong> Non inserire nomi di persone, targhe, numeri di telefono, indirizzi privati o altri dati personali nel testo. La descrizione di un pericolo non richiede l'identificazione di chi si trova nelle vicinanze.</p></aside>
+        </section>
+
+        <section aria-labelledby="cookie">
+          <h2 id="cookie">Il cookie tecnico e il riconoscimento dei voti</h2>
+          <p>L'API imposta il cookie <code>passo_session</code>, con una durata massima di 365 giorni. Contiene un identificatore casuale firmato; non contiene il tuo nome o un indirizzo email. È un cookie <code>HttpOnly</code>, quindi non è leggibile dagli script della pagina, e usa <code>SameSite=Lax</code>; sul sito HTTPS è marcato anche <code>Secure</code>.</p>
+          <p>Il servizio ricava da quell'identificatore un valore pseudonimo per distinguere il voto dello stesso browser su una segnalazione. Questo permette di evitare conferme ripetute e di sostituire un voto di presenza con un voto di rimozione, o viceversa. Non è un account personale e non dimostra che due browser appartengano a persone diverse.</p>
+          <p>Puoi cancellare il cookie dalle impostazioni del browser. Alla visita successiva l'API può creare una nuova sessione: cancellare il cookie non cancella automaticamente segnalazioni o voti già conservati sul server. Browser, profili e indirizzi del sito differenti possono usare sessioni separate.</p>
+          <p>Le pagine statiche delle guide e del progetto non richiedono da sole una chiamata all'API delle segnalazioni. Aprire la mappa, invece, comporta richieste al servizio e l'eventuale impostazione del cookie tecnico.</p>
+        </section>
+
+        <section aria-labelledby="conservazione">
+          <h2 id="conservazione">Visibilità e conservazione sono due cose diverse</h2>
+          <p>Sul servizio Cloudflare le segnalazioni e i relativi voti sono conservati in un database SQLite persistente, gestito da un Durable Object. La visibilità ordinaria termina dopo 24 ore dalla creazione; per gli autovelox mobili termina dopo un'ora. Tre voti di rimozione di browser distinti possono risolvere un punto prima della scadenza. Le conferme non prolungano la durata.</p>
+          <p>La scomparsa dalla mappa non coincide con la cancellazione immediata del record. La manutenzione programmata elimina le segnalazioni e i voti collegati quando sono trascorse almeno ulteriori 24 ore dalla scadenza originaria. Una segnalazione risolta prima resta quindi soggetta a quella scadenza, non a una cancellazione istantanea. L'esecuzione della manutenzione dipende dal servizio di hosting.</p>
+          <p>Per limitare richieste ripetute, il servizio usa anche finestre temporali di dieci minuti. Nel database sono registrati contatori associati alla sessione pseudonima e a un'impronta firmata dell'indirizzo IP; il codice dell'app non salva in queste tabelle l'indirizzo IP in chiaro. I contatori scaduti vengono rimossi dalla manutenzione.</p>
+          <p>Queste descrizioni riguardano il database dell'app. Non definiscono i tempi di eventuali registri tecnici del fornitore di hosting. Non è disponibile nell'interfaccia una funzione per esportare o cancellare autonomamente tutti i dati server associati a un browser.</p>
+        </section>
+
+        <section aria-labelledby="servizi-esterni">
+          <h2 id="servizi-esterni">Servizi esterni</h2>
+          <h3>Cloudflare</h3>
+          <p>Cloudflare ospita le pagine, l'API e il database del servizio pubblicato. Riceve le normali informazioni necessarie a gestire le connessioni, fra cui l'indirizzo IP e dati della richiesta. Le pagine informative possono essere lette senza caricare la mappa.</p>
+          <p><a href="https://www.cloudflare.com/privacypolicy/" target="_blank" rel="noreferrer">Informativa sulla privacy di Cloudflare</a>.</p>
+          <h3>OpenStreetMap</h3>
+          <p>La mappa richiede immagini cartografiche ai server di OpenStreetMap. Questi ricevono le normali informazioni di connessione e, attraverso le immagini richieste, l'area visualizzata. L'app non invia loro il testo o i dettagli delle tue segnalazioni. Caricare una mappa centrata vicino a te richiede comunque le immagini relative a quell'area.</p>
+          <p><a href="https://osmfoundation.org/wiki/Privacy_Policy" target="_blank" rel="noreferrer">Informativa sulla privacy di OpenStreetMap</a>.</p>
+          <h3>Google AdSense</h3>
+          <p>Nella configurazione attuale le pagine pubbliche non caricano lo script pubblicitario AdSense e non inseriscono unità pubblicitarie. Il metatag di verifica e il file pubblico <a href="/ads.txt">ads.txt</a> riportano soltanto l'identificativo pubblico dell'account publisher: non caricano da soli uno script Google e non indicano che il sito sia approvato per gli annunci.</p>
+          <p>Un'eventuale attivazione futura richiederà una configurazione separata e la gestione delle scelte di consenso. Questa pagina dovrà essere aggiornata per descrivere i trattamenti effettivamente attivati. I collegamenti alle informative esterne sono semplici link, non contenuti Google incorporati.</p>
+          <p><a href="https://policies.google.com/privacy?hl=it" target="_blank" rel="noreferrer">Informativa sulla privacy di Google</a>.</p>
+        </section>
+
+        <section aria-labelledby="conoscere-servizio">
+          <h2 id="conoscere-servizio">Usare le informazioni con consapevolezza</h2>
+          <p>Il <a href="/progetto/">progetto e il metodo di Passo</a> spiegano che cosa rappresentano i contributi della community e quali limiti hanno. La <a href="/guide/segnalare-un-pericolo/">guida alla segnalazione</a> aiuta a condividere soltanto i dettagli utili alla strada; la <a href="/guide/leggere-la-mappa/">guida alla lettura della mappa</a> chiarisce conferme, scadenze e punti non più attivi.</p>
+        </section>
+      </article>
+    </main>
+    <footer class="content-footer"><a href="/">Apri la mappa</a><a href="/guide/">Guide di Passo</a><a href="/progetto/">Il progetto</a><a href="/privacy/">Privacy e dati</a></footer>
+  </body>
+</html>
